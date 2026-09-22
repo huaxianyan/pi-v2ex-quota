@@ -1,0 +1,280 @@
+# pi-v2ex-quota
+
+[简体中文](README.md) | [English](README.en.md)
+
+> 本仓库名为 `pi-v2ex-usage`。扩展本身叫 `pi-v2ex-quota` —— 包名、配置文件名、日志文件名与斜杠命令都以它为基础，所以保持不变。
+
+把 V2EX AI Chat 的配额接进 pi 的状态栏，并在配额用尽时等窗口刷新后自动继续。
+
+## 它做什么
+
+1. **状态栏显示**：剩余额度百分比与距离窗口重置的倒计时。
+2. **立刻接手**：配额用尽时（HTTP 429 + token 余额归零）马上中止本轮，不再陪 pi 把三次退避重试跑完。
+3. **自动续跑**（可选开关）：等到窗口刷新，先复核配额，再注入一条消息让 agent 接着做没做完的事。
+
+## 安装
+
+推荐用本地路径挂载，改代码后 `/reload` 即可生效，不需要重新发布：
+
+```bash
+pi install /path/to/pi-v2ex-quota
+```
+
+一次性的临时加载：
+
+```bash
+pi -e /path/to/pi-v2ex-quota/src/index.ts
+```
+
+移除：`pi remove /path/to/pi-v2ex-quota`。
+
+## 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/v2ex` | 立即取一次配额，并展开／收起详情面板 |
+| `/v2ex refresh` | 只重新取一次配额 |
+| `/v2ex status on\|off` | 状态栏是否显示配额 |
+| `/v2ex wait on\|off` | 是否启用自动续跑 |
+| `/v2ex start [提示词]` | 已知配额用尽，立即排入等待并自动续跑（不必先发一条消息去撞墙） |
+| `/v2ex cancel` | 取消等待中的自动续跑 |
+| `/v2ex debug on\|off` | 写调试日志到 agent 目录下的 `v2ex-quota.log` |
+
+## 配置
+
+单个全局文件 `~/.pi/agent/v2ex-quota.json`，不提供项目级覆盖：配额是账号维度的，跟项目无关，多一层覆盖只会让「现在是开还是关」变难判断。
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `status` | `true` | 在状态栏显示配额 |
+| `autoWait` | `false` | 配额用尽时等待刷新并自动续跑 |
+| `pollSeconds` | `60` | 轮询间隔，同时也是状态栏刷新间隔，范围 15–3600 |
+| `resumeBufferSeconds` | `20` | 过了重置时间再等几秒，避开服务端与本地时钟的偏差 |
+| `maxResumeAttempts` | `3` | 同一窗口内最多续跑几次，防止反复空转 |
+| `resumePrompt` | `配额已刷新，继续完成任务。` | 续跑时注入的消息正文 |
+| `baseUrl` | 未设置 | 覆盖从 `models.json` 读到的值 |
+| `apiKey` | 未设置 | 覆盖从 `models.json` 读到的值 |
+| `debug` | `false` | 写调试日志 |
+
+`baseUrl` 与 `apiKey` 不设置时，从 `~/.pi/agent/models.json` 里的 `providers.v2ex` 读取，`apiKey` 支持 `$VAR` 与 `${VAR}` 写法。
+
+## 状态栏怎么读
+
+```
+v2ex 87% · 4h12m       剩余 87%，距重置 4 小时 12 分
+v2ex 0% · 2h41m        配额用尽，还没排入等待
+v2ex 等待 2h41m        已排入自动续跑，倒计时结束后继续
+v2ex 空闲              没有有效窗口，发下一条消息时开新窗口
+v2ex --                还没取到数据
+```
+
+百分比是**剩余**额度，不是已用。颜色：正常情况下暗色，剩余不足 15% 转告警色，用尽转错误色，等待中为强调色。
+
+## 自动续跑的工作方式
+
+1. **判定配额用尽**：HTTP 429 且 `x-ai-chat-token-remaining` 为 0。只看状态码不够 —— 每分钟请求限流也是 429，那时余额头仍大于 0，不该误判成配额墙。
+2. **立刻中止**：调用 `ctx.abort()`。pi 把 429 归为可重试错误，会退避重试三次，而配额墙后面重试没有任何意义。
+3. **排期**：本轮彻底结束后，用窗口重置时间加 `resumeBufferSeconds` 作为续跑时刻。拿不到重置时间时兜底 5 分钟后重试。
+4. **到点先复核**：重新查一次配额。如果只是时间到了但服务端还没刷新，会顺延并计入一次尝试，超过 `maxResumeAttempts` 就停下来通知。
+5. **注入续跑**：`pi.sendUserMessage(resumePrompt)`，agent 空闲时立即触发，忙时按 `followUp` 排队。
+
+等待计划会写进 `~/.pi/agent/v2ex-quota-pending.json`，所以等待期间重启 pi 还能接着等。重启后如果项目目录变了、或自动续跑已被关掉，这份计划会被丢弃。
+
+用户自己发消息会取消等待中的自动续跑（你已经上手了，不该再自动插一条）。如果这一轮又撞上配额墙，等待会在本轮结束后按窗口重置时间重新排上 —— **取消并不会丢掉续跑，只是让它等你这一轮结束**，实测见「真机自检」一节。
+
+### 三种进入等待的方式
+
+| 怎么进来 | 触发时机 | 适用场景 |
+| --- | --- | --- |
+| 自动 | 某轮真的撞到配额墙，本轮结束后排期 | 正常干活时被墙拦下 |
+| 手动 `/v2ex start` | 立刻查一次配额，确认用尽才排 | 刚重开会话，已经知道没额度，不想再撞一次 |
+| 恢复 | 启动时读磁盘上的等待计划 | 等待期间重启了 pi |
+
+`/v2ex start` 不凭感觉排期，一切以查询结果为准：
+
+- **仍有额度** → 不排，并告诉你当前用量（这时候直接干活就行）
+- **没有活跃窗口** → 不排，发一条消息就会开新窗口
+- **配额查询失败** → 不排，避免拿着过期快照空等一轮
+- **已经在等待中** → 只提示，不覆盖既有计划
+
+如果排期时自动续跑开关是关着的，会一并打开 —— 否则续跑一轮之后再撞墙就没人接手了。`/v2ex start 接着改状态栏` 可以指定这一轮续跑注入什么，它会随等待计划落盘，重启也还在。
+
+`/v2ex start` 全程不产生 agent 轮次，所以它**本身不消耗额度**（实测见「真机自检」一节）。
+
+### 等待期间你会看到什么
+
+**pi 的「working」指示会消失，这是正常的**：`ctx.abort()` 之后本轮就已经结束了，没有任何东西在跑，等待是由扩展自己的定时器承担的，跟 agent 的运行状态无关。它还在等你的依据是状态栏的 `v2ex 等待 <倒计时>`（每 60 秒刷新一次），以及排期时收到的那两条通知。
+
+等待期间不要在那个会话里发消息：你自己发起任何一轮都会取消等待。只滚动、翻记录、看状态都不影响。
+
+## 协议依据
+
+全部来自 <https://edge.v2ex.com/help/quota> 与本机实测。
+
+查配额（只读，不会开始新窗口）：
+
+```bash
+curl -H "Authorization: Bearer <models.json 里的 v2ex apiKey>" \
+     https://edge.v2ex.com/api/v2/chat/quota
+```
+
+实测响应：
+
+```json
+{
+  "success": true,
+  "message": "Current AI Chat 5h quota",
+  "result": {
+    "active": true,
+    "total_tokens": 8020000,
+    "used_tokens": 8020000,
+    "remaining_tokens": 0,
+    "used_percent": 100,
+    "period_start": 1790057684,
+    "period_end": 1790075684,
+    "extra_usage": { "pack_count": 0, "total_tokens": 0, "used_tokens": 0, "remaining_tokens": 0 }
+  }
+}
+```
+
+配额用尽时发消息（实测）：
+
+```
+HTTP/2 429
+x-ai-chat-token-limit: 8020000
+x-ai-chat-token-remaining: 0
+x-ai-chat-token-reset: 1790075684
+x-ai-chat-extra-usage-remaining: 0
+
+{"error":{"message":"AI Chat quota exhausted","type":"rate_limit_error","param":null,"code":"rate_limit_exceeded"}}
+```
+
+窗口语义：每 5 小时一个窗口，窗口内用完即止、不累积，**没有有效窗口时下一条消息才开始新窗口，查询本身不开窗**。所以重置时间一过直接续跑即可，新消息会带一个完整额度。
+
+`models.json` 里那把 chat apiKey 可以直接当 Personal Access Token 用，不需要另配一个。
+
+## 实测发现与已知限制
+
+- **`after_provider_response` 对 429 不触发**。实测配额用尽的那几次请求，这个钩子一次都没回调，所以检测实际上靠 `message_end` 上的 `errorMessage`。钩子仍然保留，用于从成功响应的 `X-AI-Chat-*` 头里更新余额，省掉额外的轮询请求 —— `debug` 打开后日志里的 `provider response:` 行可以看出它到底有没有触发。
+- **中止之后 pi 还要收尾约 15 秒**。扩展自身的工作在检测到用尽后约 1.8 秒就结束了，剩下的时间是 pi 处理 abort 的过程，扩展层无法干预。
+- **一次性运行不接管等待**。`pi -p`（print）和 json 模式下不会写状态栏、也不排自动续跑，只做中止。原因是这类运行结束时会销毁 extension runner，之后任何 UI 调用都会抛 ctx 失效，而且留下等待计划会污染下一次交互启动。
+- **ctx 会失效**。`ctx` 捕获后在 `await` 之后使用可能抛 `This extension ctx is stale`。本扩展只在 `tui` / `rpc` 模式下写 UI，并且任何一次 UI 报错后就停止尝试写入。
+- **等待定时器是 unref 的**。等待动辄几小时，如果让它成为事件循环里最后一个句柄，pi 退出时会被它拖住 —— 写测试时的表现就是 `node --test` 一直不结束。计划已经落盘、重启能恢复，所以让定时器不阻塞进程退出是安全的。
+- **拿不到配额快照时会先退化成 5 分钟兜底**。`agent_settled` 排期用的重置时间来自最近一次配额查询；如果会话刚起、第一次轮询还没回来，那一刻就没有重置时间可用，只能先按 5 分钟排一次。到点 `resumeNow` 会重新查配额，发现仍在同一个用尽的窗口里就顺延到真正的重置时间 —— 代价是白跑一次检查、消耗一次 `maxResumeAttempts`。长时间开着的会话不会遇到（实测：会话起 1.3 秒就撞墙时排到 `+5m`，等快照落地后同样场景排到窗口重置时间）。
+
+## 开发
+
+### 让编辑器与测试能找到 pi 的类型
+
+`node_modules/@earendil-works/` 下放两个指向本机 pi 安装的软链即可（`node_modules` 已在 `.gitignore` 里）：
+
+```bash
+mkdir -p node_modules/@earendil-works
+cd node_modules/@earendil-works
+ln -s "$(npm root -g)/@earendil-works/pi-coding-agent" pi-coding-agent
+ln -s "$(npm root -g)/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui" pi-tui
+```
+
+### 跑测试
+
+```bash
+npm test
+```
+
+Node 22 自带类型擦除与测试运行器，测试直接跑 `.ts`，不需要构建，也不需要装依赖。测试覆盖协议解析与格式化，以及用假 pi、假上下文、假配额接口跑通整个扩展的注册、状态显示、中止、等待、续跑、上限停止等路径。
+
+脚本里写的是 `node --test "test/**/*.test.ts"`。**别写成 `node --test test/`** —— Node 22 不会把目录展开成测试文件，而是当成模块去 `require`，报 `Cannot find module '<项目>\test'`，并且伪装成「1 个用例失败」。加引号走 Node 自己的 glob，才能同时脱离 shell 展开。
+
+### 类型检查
+
+需要 `typescript` 与 `@types/node`。注意不要把它们装进本项目的 `node_modules`：npm 会顺手清掉上面那两个软链。装到别处再显式指定 `typeRoots`：
+
+```bash
+node <别处>/node_modules/typescript/bin/tsc \
+  --noEmit --strict --skipLibCheck --target es2023 \
+  --module nodenext --moduleResolution nodenext --allowImportingTsExtensions \
+  --types node --typeRoots <别处>/node_modules/@types \
+  src/index.ts src/config.ts src/v2ex.ts src/format.ts
+```
+
+### 追事件序列
+
+写一个只往文件里追加事件名的临时扩展，用 `-e` 挂上，就能看清 pi 到底发了哪些事件、发了多少次：
+
+```bash
+pi -p "hi" --provider v2ex --model coder --no-session --offline \
+   -ne -e ./trace.ts < /dev/null
+```
+
+**`< /dev/null` 不能省**。在非交互 shell 里跑 `pi -p`，pi 会挂在等 stdin 的 EOF，表现为完全不输出、进程不退出，看上去像是网络卡住了。
+
+### 真机自检：续跑、重新排期与手动排队
+
+`npm test` 用的是假 pi，证明的是扩展自身的逻辑。而真正依赖 pi 生命周期的三件事 —— `sendUserMessage` 在**会话空闲**时会不会开新一轮、用户接管后等待会不会重新排上、`/v2ex start` 能不能在零 agent 轮次下排期 —— 只有真 pi 能回答。这三层由 `tools/verify-resume.mjs` 覆盖：
+
+```bash
+npm run verify:resume          # 到点后能不能真的把一轮对话拉起来
+npm run verify:rearm           # 用户接管本轮后，等待会不会重新排期
+npm run verify:start           # /v2ex start 能不能直接排上（需要当时配额已用尽）
+npm run verify:start-live      # /v2ex start 排上后，到点能不能真的接上
+```
+
+四条 case 都：
+
+1. 用 `PI_CODING_AGENT_DIR` 把 agent 目录整个挪到临时目录，**不碰你真实的配置与等待计划**；
+2. 以 `--mode rpc` 起真 pi 并盯事件流／调试日志；
+3. 带断言与退出码，跑完自动清理临时目录。
+
+脚本自己找 pi 的入口：先看本仓库 `node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`（开发时那个软链就是），再退到 npm 全局目录。都不在时用环境变量指定：
+
+```bash
+PI_CLI=$(npm root -g)/@earendil-works/pi-coding-agent/dist/bundle/cli.js npm run verify:resume
+```
+
+临时 agent 目录里会有一份你 `models.json` 的副本（查配额要用它里面的 key），脚本结束时会删掉整个临时目录。
+
+`resume` 额外起一个只伪造 `GET /api/v2/chat/quota` 的本地服务，把「配额已恢复」造出来（真实窗口往往几十分钟后才刷新，等不起；LLM 请求不经过它），再预置一份十几秒后到期的等待计划，走 `restorePending → armWait → resumeNow` 真路径。实测输出（2026-09-22）：
+
+```
++ 12038ms agent_start
++ 12039ms 会话内出现用户消息: "配额已刷新，继续完成任务。"
+通过：agent_start=true 续跑消息进入会话=true
+```
+
+`rearm` 用**真实**配额接口，先预置一份等待计划，再发一条必然撞墙的消息，验证「取消 → 撞墙 → 重新排期」这条链。实测输出（2026-09-22）：
+
+```
+wait cleared: 用户已接管本轮
+quota exhausted via 错误文案; autoWait=true
+abort requested (streaming=true)
+wait armed: resume at 2026-09-22T11:15:04.000Z (in 1h12m)
+与窗口重置一致=true 不是 5 分钟兜底=true → 通过
+```
+
+`start` 同样用**真实**配额接口，但比另两条更干净：不预置计划、不发消息，只发一条 `/v2ex start <提示词>` 命令。实测输出（2026-09-22，当时配额正好归零）：
+
+```
++ 1830ms setStatus v2ex-quota = "v2ex 0% · 1h"
++ 1954ms 真实配额：active=true remaining=0 extra=0 reset=1790075684
++ 2219ms setStatus v2ex-quota = "v2ex 等待 1h"
++ 2220ms notify[info] 已排入自动续跑：1h 后继续（窗口于 2026-09-22 19:14 重置）
++ 5970ms 等待计划：{"resumeAt":1790075704000,...,"prompt":"验证用提示词：接着把状态栏对齐修掉"}
+与窗口重置一致=true 提示词随计划落盘=true 状态栏进入等待=true 未产生 agent 轮次=true → 通过
+```
+
+排期时刻正好是 `reset + resumeBufferSeconds`；自定义提示词随计划落盘；`未产生 agent 轮次=true` 说明这个命令本身不消耗额度。配额还有余量时，这条 case 会反向验证「不擅自排队」那一支。
+
+`start-live` 是 `start` 与 `resume` 的合体 —— 入口是命令、出口是新的 agent 轮次。**两条分开验过不等于链路成立**，所以专门跑一次：用假配额服务把「窗口重置」压到 8 秒后（真窗口要等几十分钟到几小时），一分钟内跑完全程。实测输出（2026-09-22）：
+
+```
++    30ms 假配额：余额 0、窗口 10:18:01Z 重置（8 秒后）
++  1683ms 已排期：2026-09-22T10:18:01.000Z（窗口重置 2026-09-22T10:18:01.000Z）
++  6699ms 额度已恢复（假的），等它到点续跑
++  7237ms agent_start
++  7238ms 会话内出现用户消息: "开始改状态栏对齐"
+排期与窗口重置一致=true 到点复核后注入=true agent 起了一轮=true 注入内容=自定义提示词=true → 通过
+```
+
+**RPC 模式还能当 UI 断言的通道**：`setStatus` / `notify` 在 RPC 下会以 `extension_ui_request` 事件推到 stdout（见 pi 的 `docs/rpc.md` 的 Extension UI Protocol），所以状态栏文案与通知内容都是可断言的。注意 `theme.fg()` 会在文本前后包 ANSI 转义，比对前先剥离 —— 脚本里的 `stripAnsi()` 就是干这个的。
+
+`--mode rpc` 是关键：它是持久会话，`ctx.mode` 为 `rpc`，会走完整的状态栏与续跑分支，同时能按行喂 JSON 命令（`{"type":"prompt","message":"/v2ex start"}` 即可执行扩展命令）、按行读事件。`print` 模式是一次性运行，扩展在里面主动什么都不做，验不了这些路径。

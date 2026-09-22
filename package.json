@@ -1,0 +1,39 @@
+{
+  "name": "pi-v2ex-quota",
+  "version": "0.1.0",
+  "private": true,
+  "description": "V2EX AI Chat 配额监视与自动续跑扩展（pi coding agent）",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "v2ex",
+    "quota"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "verify:resume": "node tools/verify-resume.mjs",
+    "verify:rearm": "node tools/verify-resume.mjs --case rearm",
+    "verify:start": "node tools/verify-resume.mjs --case start",
+    "verify:start-live": "node tools/verify-resume.mjs --case start-live",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3"
+  }
+}
