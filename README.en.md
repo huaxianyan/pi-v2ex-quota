@@ -273,6 +273,8 @@ PI_CLI=$(npm root -g)/@earendil-works/pi-coding-agent/dist/bundle/cli.js npm run
 
 The temp agent directory gets a copy of your `models.json` (the quota query needs the key from it), and the script deletes the whole temp directory when it finishes.
 
+`rearm` and `start` go through the **real** quota endpoint, so they only work where the machine can reach `edge.v2ex.com` directly. On a network that needs a proxy, those two report `quota fetch failed: ... aborted due to timeout` — the extension's own `fetch` does not read `HTTPS_PROXY` (a limitation of Node's built-in fetch). The other three cases use local fake services and are unaffected.
+
 `resume` additionally starts a local service that fakes only `GET /api/v2/chat/quota`, to create the "quota restored" condition (the real window often takes tens of minutes to reset, which is too long to wait for; LLM requests do not go through it), then pre-places a wait plan due in a dozen seconds and takes the real `restorePending → armWait → resumeNow` path. Measured output (2026-09-22):
 
 ```

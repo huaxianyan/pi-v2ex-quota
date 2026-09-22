@@ -273,6 +273,8 @@ PI_CLI=$(npm root -g)/@earendil-works/pi-coding-agent/dist/bundle/cli.js npm run
 
 临时 agent 目录里会有一份你 `models.json` 的副本（查配额要用它里面的 key），脚本结束时会删掉整个临时目录。
 
+`rearm` 与 `start` 走**真实**配额接口，所以只有本机能直连 `edge.v2ex.com` 时才跑得动。需要走代理才出网的网络里，这两条会报 `quota fetch failed: ... aborted due to timeout` —— 扩展自己的 `fetch` 不读 `HTTPS_PROXY`（那是 Node 内置 fetch 的限制）。其余三条用的是本地假服务，不受影响。
+
 `resume` 额外起一个只伪造 `GET /api/v2/chat/quota` 的本地服务，把「配额已恢复」造出来（真实窗口往往几十分钟后才刷新，等不起；LLM 请求不经过它），再预置一份十几秒后到期的等待计划，走 `restorePending → armWait → resumeNow` 真路径。实测输出（2026-09-22）：
 
 ```
