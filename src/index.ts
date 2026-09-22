@@ -31,6 +31,7 @@ import {
   formatTimestamp,
   type StatusLevel,
 } from "./format.ts";
+import { describeProxy, parseProxy } from "./proxy.ts";
 import {
   classifyTransientError,
   fetchQuota,
@@ -76,6 +77,8 @@ const SUBCOMMANDS: AutocompleteItem[] = [
   { value: "wait off", label: "wait off", description: "关闭自动续跑" },
   { value: "retry on", label: "retry on", description: "上游 5xx / 超时等瞬时故障后自动重试" },
   { value: "retry off", label: "retry off", description: "关闭上游故障自动重试" },
+  { value: "proxy", label: "proxy", description: "查看当前的查询代理" },
+  { value: "proxy off", label: "proxy off", description: "关闭查询代理，改为直连" },
   { value: "start", label: "start", description: "已知额度用尽，立即排入等待（不必先发消息）" },
   { value: "cancel", label: "cancel", description: "取消等待中的自动续跑" },
   { value: "debug on", label: "debug on", description: "写调试日志" },
@@ -205,6 +208,7 @@ export default function (pi: ExtensionAPI) {
       resumeAt: pending?.resumeAt,
       autoWaitLabel,
       retryOnErrorLabel,
+      proxyLabel: describeProxy(config.proxy),
     });
   }
 
@@ -235,7 +239,7 @@ export default function (pi: ExtensionAPI) {
     if (!endpoint) return false;
     let ok = true;
     try {
-      latest = await fetchQuota(endpoint);
+      latest = await fetchQuota(endpoint, { proxy: config.proxy });
       log(
         `quota: active=${latest.active} remaining=${latest.remainingTokens}` +
           ` extra=${latest.extraRemainingTokens} reset=${latest.periodEnd}`,
@@ -368,7 +372,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      latest = await fetchQuota(endpoint);
+      latest = await fetchQuota(endpoint, { proxy: config.proxy });
       log(`resume precheck: remaining=${latest.remainingTokens} reset=${latest.periodEnd}`);
     } catch (error) {
       log(`resume precheck failed: ${errorText(error)}`);
@@ -544,7 +548,7 @@ export default function (pi: ExtensionAPI) {
     endpoint = resolveEndpoint();
     log(
       `session_start: mode=${ctx.mode} status=${config.status} autoWait=${config.autoWait}` +
-        ` retryOnError=${config.retryOnError}` +
+        ` retryOnError=${config.retryOnError} proxy=${config.proxy || "none"}` +
         ` endpoint=${endpoint ? quotaUrl(endpoint.baseUrl) : "missing"}`,
     );
     if (!endpoint) {
@@ -718,7 +722,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("v2ex", {
-    description: "查看 V2EX AI Chat 配额，切换状态显示、自动续跑与上游故障重试，手动排入或取消等待",
+    description: "查看 V2EX AI Chat 配额，切换状态显示、自动续跑、上游故障重试与查询代理，手动排入或取消等待",
     getArgumentCompletions: (prefix: string) => {
       const items = SUBCOMMANDS.filter((item) => item.value.startsWith(prefix));
       return items.length > 0 ? [...items] : null;
@@ -762,6 +766,45 @@ export default function (pi: ExtensionAPI) {
         notify(ctx, "已取消等待中的自动续跑", "info");
         return;
       }
+      if (action === "proxy") {
+        const target = tokens.slice(1).join(" ").trim();
+        if (target.length === 0) {
+          notify(
+            ctx,
+            `查询代理：${describeProxy(config.proxy)}` +
+              "（设置：/v2ex proxy http://127.0.0.1:37777，关闭：/v2ex proxy off）",
+            "info",
+          );
+          return;
+        }
+        if (target === "off" || target === "none") {
+          config = saveConfig(agentDir, { proxy: "" });
+          log("proxy cleared");
+          // 改完立刻拿真接口验一次：地址写得对不对，用户当场就知道。
+          const cleared = await pollQuota(ctx);
+          notify(
+            ctx,
+            `查询代理已关闭，改为直连${cleared ? "，连接正常" : "，但本次查询没成功"}`,
+            cleared ? "info" : "warning",
+          );
+          return;
+        }
+        if (!parseProxy(target)) {
+          notify(ctx, `无法识别的代理地址：${target}（只支持 http://host:port）`, "warning");
+          return;
+        }
+        config = saveConfig(agentDir, { proxy: target });
+        log(`proxy set: ${describeProxy(target)}`);
+        const fetched = await pollQuota(ctx);
+        notify(
+          ctx,
+          fetched
+            ? `配额查询已走 ${describeProxy(target)}，连接正常`
+            : `已切到 ${describeProxy(target)}，但这次查询没成功，/v2ex debug on 可看日志`,
+          fetched ? "info" : "warning",
+        );
+        return;
+      }
       if (action === "status" || action === "wait" || action === "retry" || action === "debug") {
         if (value !== "on" && value !== "off") {
           notify(ctx, `用法：/v2ex ${action} on|off`, "warning");
@@ -773,7 +816,7 @@ export default function (pi: ExtensionAPI) {
       notify(
         ctx,
         `未知子命令：${action}（可用 refresh / start / cancel / status on|off / wait on|off` +
-          ` / retry on|off / debug on|off）`,
+          ` / retry on|off / proxy <url|off> / debug on|off）`,
         "warning",
       );
     },

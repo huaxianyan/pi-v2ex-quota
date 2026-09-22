@@ -96,12 +96,18 @@ export function buildStatus(input: StatusInput): StatusView {
 export interface DetailsInput extends StatusInput {
   autoWaitLabel: string;
   retryOnErrorLabel: string;
+  /** 代理的展示文案，已由调用方格式化（未设置时给「未设置（直连）」）。 */
+  proxyLabel: string;
 }
 
 /** `/v2ex` 面板的多行详情。 */
 export function buildDetails(input: DetailsInput): string[] {
-  const { window, now, waiting, waitReason, autoWaitLabel, retryOnErrorLabel } = input;
-  const toggles = [`自动续跑：${autoWaitLabel}`, `上游重试：${retryOnErrorLabel}`];
+  const { window, now, waiting, waitReason, autoWaitLabel, retryOnErrorLabel, proxyLabel } = input;
+  const toggles = [
+    `自动续跑：${autoWaitLabel}`,
+    `上游重试：${retryOnErrorLabel}`,
+    `查询代理：${proxyLabel}`,
+  ];
   const lines = ["V2EX AI Chat 配额"];
   if (!window) {
     lines.push("尚未取到配额数据，/v2ex refresh 重试", ...toggles);

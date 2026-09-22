@@ -15,6 +15,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { normalizeProxy } from "./proxy.ts";
+
 export const CONFIG_FILE = "v2ex-quota.json";
 export const PENDING_FILE = "v2ex-quota-pending.json";
 
@@ -41,6 +43,13 @@ export interface QuotaConfig {
   maxResumeAttempts: number;
   /** 自动续跑时注入的消息。 */
   resumePrompt: string;
+  /**
+   * 查询配额时走的本地 HTTP 代理，空串表示直连。
+   *
+   * 单独开这一项而不是读 HTTPS_PROXY：环境变量会影响同 shell 里的所有程序，
+   * 而这里要解决的只是「配额接口连不上」这一个问题。
+   */
+  proxy: string;
   /** 覆盖从 models.json 读到的 baseUrl。 */
   baseUrl?: string;
   /** 覆盖从 models.json 读到的 apiKey。 */
@@ -59,6 +68,7 @@ export const DEFAULT_CONFIG: QuotaConfig = {
   resumeBufferSeconds: 20,
   maxResumeAttempts: 3,
   resumePrompt: "配额已刷新，继续完成任务。",
+  proxy: "",
   baseUrl: undefined,
   apiKey: undefined,
   debug: false,
@@ -136,6 +146,7 @@ export function normalizeConfig(raw: unknown): QuotaConfig {
       DEFAULT_CONFIG.maxResumeAttempts,
     ),
     resumePrompt: resumePrompt ?? DEFAULT_CONFIG.resumePrompt,
+    proxy: normalizeProxy(source["proxy"]),
     baseUrl: optionalString(source["baseUrl"]),
     apiKey: optionalString(source["apiKey"]),
     debug: source["debug"] === true,

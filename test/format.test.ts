@@ -111,6 +111,7 @@ test("详情面板列出窗口用量与重置时间", () => {
     waiting: true,
     autoWaitLabel: "已开启（2h 后继续）",
     retryOnErrorLabel: "已关闭",
+    proxyLabel: "http://127.0.0.1:37777",
   });
   const text = lines.join("\n");
   assert.match(text, /窗口已用 1K \/ 1K/);
@@ -119,6 +120,7 @@ test("详情面板列出窗口用量与重置时间", () => {
   assert.match(text, /正在等待刷新后自动续跑/);
   assert.match(text, /自动续跑：已开启（2h 后继续）/);
   assert.match(text, /上游重试：已关闭/);
+  assert.match(text, /查询代理：http:\/\/127\.0\.0\.1:37777/);
 });
 
 test("详情面板在无窗口时说明下一条消息开新窗口", () => {
@@ -128,12 +130,14 @@ test("详情面板在无窗口时说明下一条消息开新窗口", () => {
     waiting: false,
     autoWaitLabel: "已关闭",
     retryOnErrorLabel: "已开启",
+    proxyLabel: "未设置（直连）",
   });
   const text = lines.join("\n");
   assert.match(text, /没有有效窗口/);
   // 两个开关在任何状态下都要看得见，否则「现在到底开没开」就得猜。
   assert.match(text, /自动续跑：已关闭/);
   assert.match(text, /上游重试：已开启/);
+  assert.match(text, /查询代理：未设置（直连）/);
 });
 
 test("详情面板在无数据时提示刷新", () => {
@@ -143,6 +147,7 @@ test("详情面板在无数据时提示刷新", () => {
     waiting: false,
     autoWaitLabel: "已关闭",
     retryOnErrorLabel: "已关闭",
+    proxyLabel: "未设置（直连）",
   });
   assert.match(lines.join("\n"), /\/v2ex refresh/);
 });
@@ -191,6 +196,7 @@ test("详情面板会说明上游故障重试的到点时间", () => {
     resumeAt: NOW + 45_000,
     autoWaitLabel: "已开启",
     retryOnErrorLabel: "已开启（45s 后重试）",
+    proxyLabel: "未设置（直连）",
   });
   const text = lines.join("\n");
   assert.match(text, /上游故障，45s 后自动重试/);

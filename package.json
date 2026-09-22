@@ -2,7 +2,7 @@
   "name": "pi-v2ex-quota",
   "version": "0.1.0",
   "private": true,
-  "description": "V2EX AI Chat 配额监视，配额用尽与上游瞬断时自动续跑的 pi 扩展",
+  "description": "V2EX AI Chat 配额监视，配额用尽与上游瞬断时自动续跑、查询可走本地代理的 pi 扩展",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",

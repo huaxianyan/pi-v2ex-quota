@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-把 V2EX AI Chat 的配额接进 pi 的状态栏，在配额用尽时等窗口刷新后自动继续，也可以在上游瞬时故障后接着重试。
+把 V2EX AI Chat 的配额接进 pi 的状态栏，在配额用尽时等窗口刷新后自动继续，也可以在上游瞬时故障后接着重试，配额查询还能单独走本地代理。
 
 ## 它做什么
 
@@ -10,6 +10,7 @@
 2. **立刻接手**：配额用尽时（HTTP 429 + token 余额归零）马上中止本轮，不再陪 pi 把三次退避重试跑完。
 3. **自动续跑**（可选开关）：等到窗口刷新，先复核配额，再注入一条消息让 agent 接着做没做完的事。
 4. **上游故障重试**（可选开关，默认关闭）：5xx / 超时 / 连接中断把本轮打断时，等一段退避时间后自动接着做。
+5. **查询走本地代理**（可选）：只让配额查询走你指定的 `http://` 代理，不为此改动 shell 的环境变量。
 
 ## 安装
 
@@ -48,6 +49,7 @@ pi -e /path/to/pi-v2ex-quota/src/index.ts
 | `/v2ex retry on\|off` | 是否启用上游故障自动重试（默认关闭） |
 | `/v2ex start [提示词]` | 已知配额用尽，立即排入等待并自动续跑（不必先发一条消息去撞墙） |
 | `/v2ex cancel` | 取消等待中的自动续跑或上游故障重试 |
+| `/v2ex proxy [地址\|off]` | 查看／设置／关闭配额查询用的本地代理，设置后立刻试查一次 |
 | `/v2ex debug on\|off` | 写调试日志到 agent 目录下的 `v2ex-quota.log` |
 
 ## 配置
@@ -65,6 +67,7 @@ pi -e /path/to/pi-v2ex-quota/src/index.ts
 | `resumeBufferSeconds` | `20` | 过了重置时间再等几秒，避开服务端与本地时钟的偏差 |
 | `maxResumeAttempts` | `3` | 同一窗口内最多续跑几次，防止反复空转 |
 | `resumePrompt` | `配额已刷新，继续完成任务。` | 续跑时注入的消息正文 |
+| `proxy` | 空 | 配额查询走的本地 HTTP 代理，形如 `http://127.0.0.1:37777`；空表示直连 |
 | `baseUrl` | 未设置 | 覆盖从 `models.json` 读到的值 |
 | `apiKey` | 未设置 | 覆盖从 `models.json` 读到的值 |
 | `debug` | `false` | 写调试日志 |
@@ -143,6 +146,22 @@ v2ex --                还没取到数据
 
 状态栏会从配额百分比切成 `v2ex 重试 45s`，通知里写清是哪一类故障（`HTTP 522` / 请求超时 / 连接中断）与第几次重试。
 
+## 让查询走本地代理
+
+配额查询可以单独走一个 `http://` 代理，只影响这一件事：
+
+```bash
+/v2ex proxy http://127.0.0.1:37777   # 设置，并立刻用它试查一次
+/v2ex proxy                          # 查看当前值
+/v2ex proxy off                      # 关掉，回到直连
+```
+
+也可以直接写配置里的 `proxy` 字段。只认 `http://` 代理（省略协议会按 `http://` 补），带凭据的 `http://user:pass@host:port` 也支持；写成 `socks5://` 之类会被判成非法并当场告诉你，而不是静默直连 —— 静默失效最难查。
+
+**为什么不读 `HTTPS_PROXY`**：环境变量会连带影响同一个 shell 里的所有程序，而你多半只想解决「配额接口连不上」这一件事。pi 的模型请求要不要走代理是另一回事，这里不替它做决定，也不受它影响。
+
+**实现上没绕开 Node 的限制**：内置的 `fetch` 是 undici，既不读 `HTTPS_PROXY`（那是 Node 24 的 `NODE_USE_ENV_PROXY` 之后才有），也没把 `ProxyAgent` 暴露成可 import 的模块。所以这里用 `node:net` 手搭一条 CONNECT 隧道（HTTPS 目标再补一层 TLS），零依赖，代价是只支持 http 代理。
+
 ## 协议依据
 
 全部来自 <https://edge.v2ex.com/help/quota> 与本机实测。
@@ -200,6 +219,7 @@ x-ai-chat-extra-usage-remaining: 0
 
 - **pi 自己有 auto retry，但只覆盖十几秒**。上游报错时 pi 会把整个 agent 轮次重跑一遍，退避 2s → 4s → 8s 共三次，全失败后才发 `auto_retry_end` 与 `agent_settled`（实测于 2026-09-22 的 RPC 事件流）。所以「上游故障重试」这个开关是补在它后面，不是替掉它：一次 522 从发消息到扩展排期，实际间隔约 55 秒。
 - **同一个 522，pi 给出的措辞不止一种**。真机上观察到的是 `522 status code (no body)`；假上游固定返回空 body 的 522 时，pi 给的是 `Connection error.` —— 字面里没有任何可用细节。故障分类必须两种都认，否则重试路径永远不会触发（第一次跑 `verify:retry` 就是这么失败的）。
+- **`http.request` 对非 200 的 CONNECT 响应既不报 `response` 也不报 `connect`**。拿它去发 CONNECT 时，代理回 407 只会得到一句 `socket hang up`，代理要求认证这件事直接从错误信息里消失。所以代理传输层是自己拼 CONNECT 请求并解析状态行（`test/proxy.test.ts` 里两条错误路径的用例就是钉这个的）。
 
 ## 开发
 
@@ -273,7 +293,17 @@ PI_CLI=$(npm root -g)/@earendil-works/pi-coding-agent/dist/bundle/cli.js npm run
 
 临时 agent 目录里会有一份你 `models.json` 的副本（查配额要用它里面的 key），脚本结束时会删掉整个临时目录。
 
-`rearm` 与 `start` 走**真实**配额接口，所以只有本机能直连 `edge.v2ex.com` 时才跑得动。需要走代理才出网的网络里，这两条会报 `quota fetch failed: ... aborted due to timeout` —— 扩展自己的 `fetch` 不读 `HTTPS_PROXY`（那是 Node 内置 fetch 的限制）。其余三条用的是本地假服务，不受影响。
+`rearm` 与 `start` 走**真实**配额接口，需要本机能连上 `edge.v2ex.com`。只能走代理出网的网络里这样跑：
+
+```bash
+# 扩展的配额查询走代理
+V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:start
+
+# rearm 还要发一条真消息去撞配额墙，那一步是 pi 自己的请求，所以 pi 也得能出网
+HTTPS_PROXY=http://127.0.0.1:37777 V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:rearm
+```
+
+两个变量的作用面不同，别混：`V2EX_VERIFY_PROXY` 写进临时配置的 `proxy` 字段，只管扩展的配额查询；`HTTPS_PROXY` 是给 pi 子进程的，管它自己的模型请求。少了后者，`rearm` 会表现成「消息发出去了但撞不到配额墙」—— 日志里是一串 `transient error: 请求超时`，看着像扩展坏了，其实 pi 压根没连上上游。其余三条用的是本地假服务，两个变量都不要设。
 
 `resume` 额外起一个只伪造 `GET /api/v2/chat/quota` 的本地服务，把「配额已恢复」造出来（真实窗口往往几十分钟后才刷新，等不起；LLM 请求不经过它），再预置一份十几秒后到期的等待计划，走 `restorePending → armWait → resumeNow` 真路径。实测输出（2026-09-22）：
 

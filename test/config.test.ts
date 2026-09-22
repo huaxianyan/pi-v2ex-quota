@@ -65,6 +65,17 @@ test("空的续跑文案退回默认值", () => {
   assert.equal(normalizeConfig({ resumePrompt: " 接着做 " }).resumePrompt, "接着做");
 });
 
+test("代理只留合法地址，写错了退回直连", () => {
+  assert.equal(normalizeConfig({ proxy: "http://127.0.0.1:37777" }).proxy, "http://127.0.0.1:37777");
+  assert.equal(normalizeConfig({ proxy: " 127.0.0.1:37777 " }).proxy, "127.0.0.1:37777");
+  // 非法值当没配，配置里不该留一个会让查询永远失败的值；
+  // 要报错的是输入命令的那一刻，不是每次查询。
+  assert.equal(normalizeConfig({ proxy: "socks5://127.0.0.1:1080" }).proxy, "");
+  assert.equal(normalizeConfig({ proxy: "http://" }).proxy, "");
+  assert.equal(normalizeConfig({ proxy: 42 }).proxy, "");
+  assert.equal(normalizeConfig({}).proxy, "");
+});
+
 test("配置缺失时读到默认值", () => {
   assert.deepEqual(loadConfig(tempDir()), DEFAULT_CONFIG);
 });

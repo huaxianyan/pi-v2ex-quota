@@ -13,6 +13,10 @@
  *
  * 五条路径都靠 `PI_CODING_AGENT_DIR` 把 agent 目录挪到临时目录，
  * 绝不碰你真实的配置与等待计划；跑完自动清理。
+ *
+ * 其中 start 与 rearm 打的是真实的配额接口。本机直连不到 edge.v2ex.com 时，
+ * 给它们配一个本地代理即可（用假服务的另外三条不读这个变量）：
+ *   V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:start
  */
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -24,6 +28,15 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const RESUME_PROMPT = "配额已刷新，继续完成任务。";
 const RESUME_BUFFER_SECONDS = 20;
+
+/**
+ * 真实配额接口的 case（start / rearm）可以走本地代理。
+ *
+ * 只有这两条需要它：另外三条打的是 127.0.0.1 上的假服务，绕代理反而可能被
+ * 代理自己的 bypass 规则拦住，凭空多一个失败点。
+ */
+const VERIFY_PROXY = (process.env["V2EX_VERIFY_PROXY"] ?? "").trim();
+const proxyConfig = () => (VERIFY_PROXY ? { proxy: VERIFY_PROXY } : {});
 
 const argIndex = process.argv.indexOf("--case");
 const CASE = argIndex >= 0 && process.argv[argIndex + 1] ? process.argv[argIndex + 1] : "resume";
@@ -247,7 +260,8 @@ async function caseResume(agentDir) {
  * 既不丢失，也不退化成 5 分钟的兜底重试。
  */
 async function caseRearm(agentDir) {
-  prepareAgentDir(agentDir);
+  prepareAgentDir(agentDir, undefined, proxyConfig());
+  if (VERIFY_PROXY) console.log(`${stamp()} 配额接口走代理: ${VERIFY_PROXY}`);
 
   const initialResumeAt = Date.now() + 40 * 60 * 1000;
   writeFileSync(
@@ -343,7 +357,8 @@ async function caseRearm(agentDir) {
 const stripAnsi = (text) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 async function caseStart(agentDir) {
-  prepareAgentDir(agentDir);
+  prepareAgentDir(agentDir, undefined, proxyConfig());
+  if (VERIFY_PROXY) console.log(`${stamp()} 配额接口走代理: ${VERIFY_PROXY}`);
   const customPrompt = "验证用提示词：接着把状态栏对齐修掉";
 
   const child = spawnPi(agentDir);
