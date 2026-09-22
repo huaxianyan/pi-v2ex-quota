@@ -2,8 +2,6 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-> 本仓库名为 `pi-v2ex-usage`。扩展本身叫 `pi-v2ex-quota` —— 包名、配置文件名、日志文件名与斜杠命令都以它为基础，所以保持不变。
-
 把 V2EX AI Chat 的配额接进 pi 的状态栏，并在配额用尽时等窗口刷新后自动继续。
 
 ## 它做什么
@@ -14,7 +12,13 @@
 
 ## 安装
 
-推荐用本地路径挂载，改代码后 `/reload` 即可生效，不需要重新发布：
+直接从 GitHub 安装：
+
+```bash
+pi install git:github.com/huaxianyan/pi-v2ex-quota
+```
+
+要改代码的话，用本地路径挂载更顺手 —— 改完 `/reload` 即可生效，不需要重新发布：
 
 ```bash
 pi install /path/to/pi-v2ex-quota
@@ -26,7 +30,11 @@ pi install /path/to/pi-v2ex-quota
 pi -e /path/to/pi-v2ex-quota/src/index.ts
 ```
 
-移除：`pi remove /path/to/pi-v2ex-quota`。
+移除：`pi remove git:github.com/huaxianyan/pi-v2ex-quota`（本地挂载则把源换成对应路径）。
+
+扩展的运行前提只有一个：`~/.pi/agent/models.json` 里配好了 `providers.v2ex` —— 配额接口与密钥都从那里读。
+
+装完执行 `/v2ex` 就能看到配额。
 
 ## 命令
 
@@ -155,7 +163,7 @@ x-ai-chat-extra-usage-remaining: 0
 
 ## 实测发现与已知限制
 
-- **`after_provider_response` 对 429 不触发**。实测配额用尽的那几次请求，这个钩子一次都没回调，所以检测实际上靠 `message_end` 上的 `errorMessage`。钩子仍然保留，用于从成功响应的 `X-AI-Chat-*` 头里更新余额，省掉额外的轮询请求 —— `debug` 打开后日志里的 `provider response:` 行可以看出它到底有没有触发。
+- **`after_provider_response` 只在成功响应上触发，429 时一次都不触发**。配额用尽的那几次请求，这个钩子从未回调，所以检测实际上靠 `message_end` 上的 `errorMessage`；而成功响应会回调 —— 日志里有 `provider response: status=200 tokenRemaining=4479645` 这样一行，`tokenRemaining` 就是从响应的 `X-AI-Chat-*` 头读出来的（实测于 2026-09-22）。也就是说这一个钩子覆盖不了两种响应，成功侧用它更新余额、失败侧必须另找落点。
 - **中止之后 pi 还要收尾约 15 秒**。扩展自身的工作在检测到用尽后约 1.8 秒就结束了，剩下的时间是 pi 处理 abort 的过程，扩展层无法干预。
 - **一次性运行不接管等待**。`pi -p`（print）和 json 模式下不会写状态栏、也不排自动续跑，只做中止。原因是这类运行结束时会销毁 extension runner，之后任何 UI 调用都会抛 ctx 失效，而且留下等待计划会污染下一次交互启动。
 - **ctx 会失效**。`ctx` 捕获后在 `await` 之后使用可能抛 `This extension ctx is stale`。本扩展只在 `tui` / `rpc` 模式下写 UI，并且任何一次 UI 报错后就停止尝试写入。

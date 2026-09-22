@@ -2,8 +2,6 @@
 
 [English](README.en.md) | [简体中文](README.md)
 
-> This repository is named `pi-v2ex-usage`. The extension itself is `pi-v2ex-quota` — that name is what the package, the config file, the log file and the slash commands are based on, so it is kept as-is.
-
 Surfaces your V2EX AI Chat quota in pi's status line, and automatically continues the task after the quota window resets.
 
 ## What it does
@@ -14,7 +12,13 @@ Surfaces your V2EX AI Chat quota in pi's status line, and automatically continue
 
 ## Installation
 
-Mounting by local path is recommended — after editing the code, `/reload` picks it up, no republishing needed:
+Install straight from GitHub:
+
+```bash
+pi install git:github.com/huaxianyan/pi-v2ex-quota
+```
+
+If you intend to modify the code, mounting by local path is handier — after editing, `/reload` picks it up, no republishing needed:
 
 ```bash
 pi install /path/to/pi-v2ex-quota
@@ -26,9 +30,11 @@ One-off load for a single run:
 pi -e /path/to/pi-v2ex-quota/src/index.ts
 ```
 
-To remove: `pi remove /path/to/pi-v2ex-quota`.
+To remove: `pi remove git:github.com/huaxianyan/pi-v2ex-quota` (for a local mount, swap in that path).
 
-The extension reads its endpoint and key from `providers.v2ex` in `~/.pi/agent/models.json`, so the only prerequisite is that the provider is configured there.
+There is exactly one prerequisite: `providers.v2ex` configured in `~/.pi/agent/models.json` — both the quota endpoint and the key are read from there.
+
+Run `/v2ex` after installing and the quota shows up.
 
 ## Commands
 
@@ -157,7 +163,7 @@ The chat apiKey in `models.json` can be used directly as a Personal Access Token
 
 ## Findings and known limits
 
-- **`after_provider_response` does not fire on 429.** Across the measured quota-exhausted requests this hook never called back once, so detection actually relies on the `errorMessage` carried by `message_end`. The hook is kept for updating the balance from the `X-AI-Chat-*` headers of successful responses, which saves a polling request — turn on `debug` and watch the `provider response:` lines to see whether it fires at all.
+- **`after_provider_response` fires on successful responses only, never on a 429.** Across the measured quota-exhausted requests this hook never called back, so detection actually relies on the `errorMessage` carried by `message_end`. Successful responses do fire it — the log shows a line like `provider response: status=200 tokenRemaining=4479645`, where `tokenRemaining` came straight from the response's `X-AI-Chat-*` headers (measured 2026-09-22). A single hook therefore does not cover both kinds of response: the success side uses it to refresh the balance, while the failure side needs a different landing spot.
 - **pi still needs ~15 seconds to wrap up after an abort.** The extension's own work finishes about 1.8 seconds after detecting exhaustion; the rest is pi processing the abort, which the extension layer cannot influence.
 - **One-shot runs do not take over the wait.** In `pi -p` (print) and json modes it does not write the status line and does not schedule an auto-resume; it only aborts. The reason is that these runs destroy the extension runner when they end, after which any UI call throws a stale-ctx error, and leaving a wait plan behind would pollute the next interactive startup.
 - **`ctx` can go stale.** A captured `ctx` used after an `await` can throw `This extension ctx is stale`. This extension only writes UI in `tui` / `rpc` mode, and stops trying after the first UI error.
