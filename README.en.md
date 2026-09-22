@@ -2,13 +2,14 @@
 
 [English](README.en.md) | [简体中文](README.md)
 
-Surfaces your V2EX AI Chat quota in pi's status line, and automatically continues the task after the quota window resets.
+Surfaces your V2EX AI Chat quota in pi's status line, automatically continues the task after the quota window resets, and can retry after a transient upstream failure.
 
 ## What it does
 
 1. **Status line**: remaining quota percentage and a countdown to the window reset.
 2. **Immediate takeover**: when the quota is exhausted (HTTP 429 with a zero token balance) it aborts the current turn at once, instead of sitting through pi's three backoff retries.
 3. **Auto-resume** (optional toggle): waits until the window resets, re-checks the quota, then injects a message so the agent picks up the unfinished work.
+4. **Upstream retry** (optional toggle, off by default): when a 5xx, timeout or dropped connection kills the turn, waits out a backoff and picks the work up again.
 
 ## Installation
 
@@ -44,8 +45,9 @@ Run `/v2ex` after installing and the quota shows up.
 | `/v2ex refresh` | Just re-fetch the quota |
 | `/v2ex status on\|off` | Whether the status line shows the quota |
 | `/v2ex wait on\|off` | Whether auto-resume is enabled |
+| `/v2ex retry on\|off` | Whether retry after transient upstream failures is enabled (off by default) |
 | `/v2ex start [prompt]` | Quota is known to be exhausted — queue a wait and auto-resume right away (no need to burn a message against the wall first) |
-| `/v2ex cancel` | Cancel a pending auto-resume |
+| `/v2ex cancel` | Cancel a pending auto-resume or upstream retry |
 | `/v2ex debug on\|off` | Write a debug log to `v2ex-quota.log` in the agent directory |
 
 ## Configuration
@@ -56,6 +58,9 @@ A single global file, `~/.pi/agent/v2ex-quota.json`. There is no per-project ove
 | --- | --- | --- |
 | `status` | `true` | Show the quota in the status line |
 | `autoWait` | `false` | Wait for the reset and auto-resume when the quota is exhausted |
+| `retryOnError` | `false` | Retry with backoff on upstream 5xx / timeout / connection loss |
+| `errorRetrySeconds` | `60` | First retry delay in seconds; doubles afterwards; range 5–3600 |
+| `maxErrorRetries` | `3` | Consecutive retry cap; a successful response or you taking over the turn resets it; range 1–10 |
 | `pollSeconds` | `60` | Poll interval, also the status line refresh interval; range 15–3600 |
 | `resumeBufferSeconds` | `20` | How long to wait past the reset time, to absorb clock skew between the server and the local machine |
 | `maxResumeAttempts` | `3` | Maximum resumes within one window, to prevent spinning |
@@ -72,11 +77,34 @@ When `baseUrl` and `apiKey` are unset, they are read from `providers.v2ex` in `~
 v2ex 87% · 4h12m        87% remaining, resets in 4h12m
 v2ex 0% · 2h41m         Quota exhausted, no wait queued yet
 v2ex 等待 2h41m         Auto-resume queued, continues when the countdown ends
+v2ex 重试 45s           Upstream failed, waiting out a backoff (unrelated to remaining quota)
 v2ex 空闲               No active window; the next message opens one
 v2ex --                 No data fetched yet
 ```
 
-Note that the visible status text is in Chinese (`等待` = waiting, `空闲` = idle, `--` = unknown). The percentage is the **remaining** quota, not the used amount. Colors: dim in the normal case, warning color below 15% remaining, error color when exhausted, accent color while waiting.
+Note that the visible status text is in Chinese (`等待` = waiting, `重试` = retrying, `空闲` = idle, `--` = unknown). The percentage is the **remaining** quota, not the used amount. Colors: dim in the normal case, warning color below 15% remaining, error color when exhausted, accent color while waiting or retrying.
+
+## Automatic retry on upstream failures
+
+Beyond the quota wall there is a second class of interruption: upstream 5xx, request timeouts, dropped connections. A retry usually gets through, but pi's own retries only cover the first dozen seconds.
+
+**Off by default**; turn it on with `/v2ex retry on`. Only errors where "try again" could plausibly work are recognised:
+
+| Recognised | Not recognised |
+| --- | --- |
+| 5xx (including 522) and 429 rate limiting | Other 4xx (400 / 401 / 404…) |
+| Request timeout | Quota exhaustion (that belongs to auto-resume) |
+| Dropped connection (`ECONNRESET`, `socket hang up`, `Connection error.`) | Anything unrecognisable |
+
+A few boundaries:
+
+- **It does not fight pi's built-in retries.** pi first does three fast retries of its own (2s / 4s / 8s, re-running the whole agent turn each time); the extension takes over at the moment pi gives up — `agent_settled`. So the real rhythm is: pi tries three times quickly (about 55 seconds), and only then do the extension's minute-scale backoffs start.
+- **Backoff doubles.** `errorRetrySeconds` for the first wait, doubling each time, capped at 15 minutes; after `maxErrorRetries` attempts it stops and tells you.
+- **Quota is irrelevant here.** It retries when the time is up, with no quota pre-check — the upstream being down and how much quota you have are two separate things. If it does hit the quota wall, the quota path takes over instead.
+- **One success resets the count.** As soon as a request actually goes through, the consecutive-failure count goes back to zero; so does you taking over the turn manually.
+- **The wait plan is persisted too.** Restarting pi resumes it; but if you turned `/v2ex retry off`, restoring the plan at startup is skipped as well.
+
+The status line switches from the quota percentage to `v2ex 重试 45s`, and the notification names the failure class (`HTTP 522` / request timeout / connection loss) and which attempt this is.
 
 ## How auto-resume works
 
@@ -170,6 +198,9 @@ The chat apiKey in `models.json` can be used directly as a Personal Access Token
 - **The wait timer is unref'd.** Waits run for hours; if the timer were the last handle in the event loop, it would hold up pi's exit — in tests the symptom is `node --test` never finishing. The plan is already on disk and recoverable after a restart, so not blocking process exit is safe.
 - **Without a quota snapshot it degrades to a 5-minute fallback first.** The reset time used when scheduling on `agent_settled` comes from the most recent quota query; if the session just started and the first poll has not returned, there is no reset time to use, so it schedules 5 minutes out first. On arrival `resumeNow` queries again and, finding itself still inside the same exhausted window, defers to the real reset time — the cost is one wasted check and one `maxResumeAttempts` slot. Long-running sessions never hit this (measured: hitting the wall 1.3 seconds into a session scheduled `+5m`; the same scenario schedules the window reset time once the snapshot has landed).
 
+- **pi has auto-retry of its own, but it only covers the first dozen seconds.** On an upstream error pi re-runs the whole agent turn, backing off 2s → 4s → 8s for three attempts, and only then emits `auto_retry_end` and `agent_settled` (measured on 2026-09-22 from the RPC event stream). So the upstream-retry toggle is an addition behind it, not a replacement: for one 522, the gap between sending the message and the extension scheduling is about 55 seconds.
+- **The same 522 comes out of pi in more than one phrasing.** On device the observed `errorMessage` was `522 status code (no body)`; with a fake upstream that returns an empty-bodied 522, pi reports `Connection error.` — with no usable detail in the text at all. The failure classifier has to accept both, otherwise the retry path never fires (which is exactly how the first `verify:retry` run failed).
+
 ## Development
 
 ### Making the editor and the tests find pi's types
@@ -216,18 +247,19 @@ pi -p "hi" --provider v2ex --model coder --no-session --offline \
 
 **`< /dev/null` is not optional.** Running `pi -p` in a non-interactive shell, pi blocks waiting for EOF on stdin, which looks like no output at all and a process that never exits — easy to misread as a network problem.
 
-### On-device self-checks: resume, re-arm and manual queueing
+### On-device self-checks: resume, re-arm, manual queueing and upstream retry
 
-`npm test` uses a fake pi, so it proves the extension's own logic. But the three things that genuinely depend on pi's lifecycle — whether `sendUserMessage` opens a new turn when the **session is idle**, whether the wait is re-armed after the user takes over, and whether `/v2ex start` can schedule with zero agent turns — can only be answered by a real pi. `tools/verify-resume.mjs` covers those three layers:
+`npm test` uses a fake pi, so it proves the extension's own logic. But the things that genuinely depend on pi's lifecycle — whether `sendUserMessage` opens a new turn when the **session is idle**, whether the wait is re-armed after the user takes over, whether `/v2ex start` can schedule with zero agent turns, and whether the task really continues after an upstream failure — can only be answered by a real pi. `tools/verify-resume.mjs` covers those layers:
 
 ```bash
 npm run verify:resume          # does it really start a turn when the time arrives
 npm run verify:rearm           # is the wait re-armed after the user takes over
 npm run verify:start           # can /v2ex start schedule directly (requires quota to be exhausted at the time)
 npm run verify:start-live      # after /v2ex start schedules, does it really connect when the time arrives
+npm run verify:retry           # does it retry with backoff after an upstream 522
 ```
 
-All four cases:
+All five cases:
 
 1. Move the whole agent directory to a temp dir via `PI_CODING_AGENT_DIR`, so **your real config and wait plan are never touched**;
 2. Start a real pi with `--mode rpc` and watch the event stream / debug log;
@@ -282,6 +314,20 @@ The scheduled time is exactly `reset + resumeBufferSeconds`; the custom prompt i
 +  7238ms 会话内出现用户消息: "开始改状态栏对齐"
 排期与窗口重置一致=true 到点复核后注入=true agent 起了一轮=true 注入内容=自定义提示词=true → 通过
 ```
+
+`retry` starts a fake upstream whose quota endpoint is healthy while completions always return 522, acting the upstream failure out. pi insists on three retries of its own before handing over, so this case takes over a minute. Measured output (2026-09-22):
+
+```
++  1654ms agent_start（第 1 次）
++ 11751ms pi 自己的重试：第 1/3 次，2000ms 后
++ 55836ms pi 自己的重试结束：success=false
++ 56190ms 已排期: 2026-09-22T11:52:43.164Z（5s 后，reason=error）
++ 60907ms agent_start（第 5 次）
++ 60907ms 会话内出现用户消息: "配额已刷新，继续完成任务。"
+计划 reason=error=true（值 error）退避约 5s=true／到点注入=true 注入后又起一轮=true（4 → 5）→ 通过
+```
+
+Three lines in the extension's own log corroborate the same story: `transient error: 连接中断 (Connection error.) retryOnError=true` (one per pi failure, four in total), `wait armed: resume at ... (error, in 5s)`, and `resume: injecting continuation (error)`.
 
 **RPC mode also works as a channel for UI assertions**: under RPC, `setStatus` / `notify` are pushed to stdout as `extension_ui_request` events (see pi's `docs/rpc.md`, Extension UI Protocol), so the status line text and notification content are both assertable. Note that `theme.fg()` wraps the text in ANSI escapes, so strip them before comparing — that is what `stripAnsi()` in the script is for.
 

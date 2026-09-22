@@ -22,6 +22,7 @@ import {
   saveConfig,
   writePending,
   type QuotaConfig,
+  type WaitReason,
 } from "./config.ts";
 import {
   buildDetails,
@@ -31,6 +32,7 @@ import {
   type StatusLevel,
 } from "./format.ts";
 import {
+  classifyTransientError,
   fetchQuota,
   isExhausted,
   isQuotaExhaustedSignal,
@@ -40,6 +42,7 @@ import {
   readV2exProvider,
   resetDeadlineMs,
   type QuotaWindow,
+  type TransientError,
   type V2exEndpoint,
 } from "./v2ex.ts";
 
@@ -49,6 +52,9 @@ const LOG_FILE = "v2ex-quota.log";
 
 /** 拿不到窗口重置时间时的兜底重试间隔。 */
 const FALLBACK_RETRY_MS = 5 * 60 * 1000;
+
+/** 上游故障重试的退避上限：再怎么连续失败也不会等超过这么久。 */
+const MAX_ERROR_RETRY_MS = 15 * 60 * 1000;
 
 /** setTimeout 超过该值会退化成 1ms 触发，长等待分段进行。 */
 const MAX_TIMER_MS = 2_147_000_000;
@@ -68,6 +74,8 @@ const SUBCOMMANDS: AutocompleteItem[] = [
   { value: "status off", label: "status off", description: "隐藏状态栏配额" },
   { value: "wait on", label: "wait on", description: "配额用尽时等待刷新并自动续跑" },
   { value: "wait off", label: "wait off", description: "关闭自动续跑" },
+  { value: "retry on", label: "retry on", description: "上游 5xx / 超时等瞬时故障后自动重试" },
+  { value: "retry off", label: "retry off", description: "关闭上游故障自动重试" },
   { value: "start", label: "start", description: "已知额度用尽，立即排入等待（不必先发消息）" },
   { value: "cancel", label: "cancel", description: "取消等待中的自动续跑" },
   { value: "debug on", label: "debug on", description: "写调试日志" },
@@ -78,15 +86,27 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 内存里的等待计划。落盘用的 PendingResume 里 reason 是可选的（兼容旧文件），这里统一填好。 */
+interface PendingWait {
+  resumeAt: number;
+  attempts: number;
+  prompt?: string;
+  reason: WaitReason;
+}
+
 export default function (pi: ExtensionAPI) {
   const agentDir = getAgentDir();
   let config: QuotaConfig = loadConfig(agentDir);
   let endpoint: V2exEndpoint | undefined;
   let latest: QuotaWindow | undefined;
-  let pending: { resumeAt: number; attempts: number; prompt?: string } | undefined;
+  let pending: PendingWait | undefined;
   let detailsVisible = false;
   let selfResume = false;
   let quotaHit = false;
+  let transientHit = false;
+  let transientError: TransientError | undefined;
+  let transientAttempts = 0;
+  let transientAdvised = false;
   let projectCwd = "";
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let resumeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -153,23 +173,38 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setStatus(STATUS_KEY, undefined);
         return;
       }
-      const view = buildStatus({ window: latest, now: Date.now(), waiting: pending !== undefined });
+      const view = buildStatus({
+        window: latest,
+        now: Date.now(),
+        waiting: pending !== undefined,
+        waitReason: pending?.reason,
+        resumeAt: pending?.resumeAt,
+      });
       ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(LEVEL_COLORS[view.level], view.text));
     });
   }
 
   function detailLines(): string[] {
+    const waiting = pending !== undefined;
+    const away = (): string => formatDuration((pending?.resumeAt ?? Date.now()) - Date.now());
+
     let autoWaitLabel = "已关闭";
     if (config.autoWait) {
-      autoWaitLabel = pending
-        ? `已开启（${formatDuration(pending.resumeAt - Date.now())} 后继续）`
-        : "已开启";
+      autoWaitLabel = waiting && pending?.reason === "quota" ? `已开启（${away()} 后继续）` : "已开启";
+    }
+    let retryOnErrorLabel = "已关闭";
+    if (config.retryOnError) {
+      retryOnErrorLabel =
+        waiting && pending?.reason === "error" ? `已开启（${away()} 后重试）` : "已开启";
     }
     return buildDetails({
       window: latest,
       now: Date.now(),
-      waiting: pending !== undefined,
+      waiting,
+      waitReason: pending?.reason,
+      resumeAt: pending?.resumeAt,
       autoWaitLabel,
+      retryOnErrorLabel,
     });
   }
 
@@ -244,6 +279,7 @@ export default function (pi: ExtensionAPI) {
       attempts: pending.attempts,
       cwd: projectCwd,
       prompt: pending.prompt,
+      reason: pending.reason,
     });
   }
 
@@ -261,20 +297,28 @@ export default function (pi: ExtensionAPI) {
     renderDetails(ctx);
   }
 
-  function armWait(ctx: ExtensionContext, resumeAt: number, prompt?: string): void {
+  function armWait(
+    ctx: ExtensionContext,
+    resumeAt: number,
+    prompt?: string,
+    reason: WaitReason = "quota",
+  ): void {
     if (resumeTimer) {
       clearTimeout(resumeTimer);
       resumeTimer = undefined;
     }
     if (pending) {
       pending.resumeAt = resumeAt;
+      pending.reason = reason;
       if (prompt !== undefined) pending.prompt = prompt;
     } else {
-      pending = { resumeAt, attempts: 0, prompt };
+      pending = { resumeAt, attempts: 0, prompt, reason };
     }
     persistPending();
     const delay = Math.max(1_000, resumeAt - Date.now());
-    log(`wait armed: resume at ${new Date(resumeAt).toISOString()} (in ${formatDuration(delay)})`);
+    log(
+      `wait armed: resume at ${new Date(resumeAt).toISOString()} (${reason}, in ${formatDuration(delay)})`,
+    );
     const timer = setTimeout(() => {
       void resumeNow(ctx);
     }, Math.min(delay, MAX_TIMER_MS));
@@ -285,13 +329,39 @@ export default function (pi: ExtensionAPI) {
     renderDetails(ctx);
   }
 
+  /**
+   * 注入续跑消息并收干净等待状态。
+   * 空闲时直接开新一轮；正跑着就排到队列后面，别打断进行中的轮次。
+   */
+  function injectResume(ctx: ExtensionContext, current: PendingWait, note: string): void {
+    const prompt = current.prompt ?? config.resumePrompt;
+    pending = undefined;
+    clearPending(agentDir);
+    selfResume = true;
+    log(`resume: injecting continuation (${current.reason})`);
+    notify(ctx, note, "info");
+    refreshStatus(ctx);
+    renderDetails(ctx);
+    if (ctx.isIdle()) pi.sendUserMessage(prompt);
+    else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  }
+
   async function resumeNow(ctx: ExtensionContext): Promise<void> {
     resumeTimer = undefined;
-    if (!pending) return;
-    if (Date.now() < pending.resumeAt) {
-      armWait(ctx, pending.resumeAt);
+    const current = pending;
+    if (!current) return;
+    if (Date.now() < current.resumeAt) {
+      armWait(ctx, current.resumeAt, current.prompt, current.reason);
       return;
     }
+
+    // 上游故障的重试不做额度预检：到点就是唯一条件。
+    // 真撞上配额墙的话，after_provider_response 那条路会另行接管。
+    if (current.reason === "error") {
+      injectResume(ctx, current, "上游故障，自动重试未完成的任务");
+      return;
+    }
+
     if (!endpoint) {
       clearWait("v2ex provider 已不可解析", ctx);
       return;
@@ -308,27 +378,45 @@ export default function (pi: ExtensionAPI) {
     const bufferedDeadline =
       deadline === undefined ? undefined : deadline + config.resumeBufferSeconds * 1000;
     if (isExhausted(latest) && bufferedDeadline !== undefined && bufferedDeadline > Date.now()) {
-      if (pending.attempts >= config.maxResumeAttempts) {
-        clearWait(`已续跑 ${pending.attempts} 次仍未恢复`, ctx);
+      if (current.attempts >= config.maxResumeAttempts) {
+        clearWait(`已续跑 ${current.attempts} 次仍未恢复`, ctx);
         notify(ctx, "V2EX 配额仍未恢复，已停止自动续跑", "warning");
         return;
       }
-      pending.attempts += 1;
-      armWait(ctx, bufferedDeadline);
+      current.attempts += 1;
+      armWait(ctx, bufferedDeadline, current.prompt, "quota");
       return;
     }
 
-    const attempts = pending.attempts;
-    const prompt = pending.prompt ?? config.resumePrompt;
-    pending = undefined;
-    clearPending(agentDir);
-    selfResume = true;
-    log(`resume: injecting continuation after ${attempts} attempt(s)`);
-    notify(ctx, "V2EX 配额已刷新，继续未完成的任务", "info");
-    refreshStatus(ctx);
-    renderDetails(ctx);
-    if (ctx.isIdle()) pi.sendUserMessage(prompt);
-    else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+    injectResume(ctx, current, "V2EX 配额已刷新，继续未完成的任务");
+  }
+
+  /** 上游故障的退避：首次 errorRetrySeconds，之后按次数翻倍，封顶 MAX_ERROR_RETRY_MS。 */
+  function errorRetryDelayMs(attempt: number): number {
+    return Math.min(config.errorRetrySeconds * 1000 * 2 ** Math.max(0, attempt), MAX_ERROR_RETRY_MS);
+  }
+
+  /**
+   * 上游瞬时故障（5xx / 超时 / 连接中断）。
+   *
+   * 这里只记状态，排期留给 agent_settled —— 那才是本轮真正结束、
+   * 可以接下一轮的时点。在 message_end 里排期是在跟 pi 自己的收尾抢时序。
+   */
+  function handleTransientError(
+    ctx: ExtensionContext,
+    transient: TransientError,
+    raw: string,
+  ): void {
+    log(`transient error: ${transient.label} (${raw}) retryOnError=${config.retryOnError}`);
+    if (!config.retryOnError) {
+      if (!transientAdvised) {
+        transientAdvised = true;
+        notify(ctx, `V2EX 上游${transient.label}；/v2ex retry on 可开启故障后自动重试`, "info");
+      }
+      return;
+    }
+    transientHit = true;
+    transientError = transient;
   }
 
   function handleExhausted(ctx: ExtensionContext, source: string): void {
@@ -429,15 +517,24 @@ export default function (pi: ExtensionAPI) {
       log(`stored wait dropped: cwd ${stored.cwd} != ${ctx.cwd}`);
       return;
     }
-    if (!config.autoWait) {
+    // 恢复也要看对应的开关：关掉开关后留着计划，只会在下次启动时悄悄生效。
+    const reason: WaitReason = stored.reason ?? "quota";
+    const enabled = reason === "error" ? config.retryOnError : config.autoWait;
+    if (!enabled) {
       clearPending(agentDir);
-      log("stored wait dropped: autoWait disabled");
+      log(`stored wait dropped: ${reason} 对应的开关已关闭`);
       return;
     }
-    pending = { resumeAt: stored.resumeAt, attempts: stored.attempts, prompt: stored.prompt };
-    log(`stored wait restored: resume at ${new Date(stored.resumeAt).toISOString()}`);
-    armWait(ctx, Math.max(stored.resumeAt, Date.now() + 2_000));
-    notify(ctx, `V2EX 配额等待已恢复，${formatDuration(pending.resumeAt - Date.now())} 后自动继续`, "info");
+    pending = {
+      resumeAt: stored.resumeAt,
+      attempts: stored.attempts,
+      prompt: stored.prompt,
+      reason,
+    };
+    log(`stored wait restored (${reason}): resume at ${new Date(stored.resumeAt).toISOString()}`);
+    armWait(ctx, Math.max(stored.resumeAt, Date.now() + 2_000), stored.prompt, reason);
+    const what = reason === "error" ? "上游故障重试" : "配额等待";
+    notify(ctx, `V2EX ${what}已恢复，${formatDuration(pending.resumeAt - Date.now())} 后自动继续`, "info");
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -447,6 +544,7 @@ export default function (pi: ExtensionAPI) {
     endpoint = resolveEndpoint();
     log(
       `session_start: mode=${ctx.mode} status=${config.status} autoWait=${config.autoWait}` +
+        ` retryOnError=${config.retryOnError}` +
         ` endpoint=${endpoint ? quotaUrl(endpoint.baseUrl) : "missing"}`,
     );
     if (!endpoint) {
@@ -479,6 +577,11 @@ export default function (pi: ExtensionAPI) {
       refreshStatus(ctx);
       renderDetails(ctx);
     }
+    // 真正走通一次，就把「连续故障」的账清零。
+    if (event.status < 400) {
+      transientAttempts = 0;
+      transientAdvised = false;
+    }
     if (isQuotaExhaustedSignal(event.status, event.headers)) {
       handleExhausted(ctx, `HTTP ${event.status}`);
     }
@@ -493,23 +596,64 @@ export default function (pi: ExtensionAPI) {
     };
     if (message.role !== "assistant") return;
     if (message.stopReason !== "error" || !message.errorMessage) return;
-    if (!QUOTA_EXHAUSTED_PATTERN.test(message.errorMessage)) return;
-    handleExhausted(ctx, "错误文案");
+    if (QUOTA_EXHAUSTED_PATTERN.test(message.errorMessage)) {
+      handleExhausted(ctx, "错误文案");
+      return;
+    }
+    const transient = classifyTransientError(message.errorMessage);
+    if (transient) handleTransientError(ctx, transient, message.errorMessage);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     lastCtx = ctx;
-    if (!quotaHit) return;
-    quotaHit = false;
-    if (!config.autoWait || pending) return;
-    if (!canUseUi(ctx)) {
-      log("auto wait skipped: 当前模式没有可续跑的交互会话");
+
+    if (quotaHit) {
+      quotaHit = false;
+      if (!config.autoWait || pending) return;
+      if (!canUseUi(ctx)) {
+        log("auto wait skipped: 当前模式没有可续跑的交互会话");
+        return;
+      }
+      const deadline = resetDeadlineMs(latest);
+      const resumeAt =
+        (deadline ?? Date.now() + FALLBACK_RETRY_MS) + config.resumeBufferSeconds * 1000;
+      armWait(ctx, resumeAt, undefined, "quota");
+      notify(
+        ctx,
+        `V2EX 配额将在 ${formatDuration(resumeAt - Date.now())} 后刷新，已排入自动续跑`,
+        "info",
+      );
       return;
     }
-    const deadline = resetDeadlineMs(latest);
-    const resumeAt = (deadline ?? Date.now() + FALLBACK_RETRY_MS) + config.resumeBufferSeconds * 1000;
-    armWait(ctx, resumeAt);
-    notify(ctx, `V2EX 配额将在 ${formatDuration(resumeAt - Date.now())} 后刷新，已排入自动续跑`, "info");
+
+    if (!transientHit) return;
+    transientHit = false;
+    if (!config.retryOnError || pending) return;
+    if (!canUseUi(ctx)) {
+      log("auto retry skipped: 当前模式没有可续跑的交互会话");
+      return;
+    }
+
+    const attempt = transientAttempts;
+    if (attempt >= config.maxErrorRetries) {
+      // 到上限就别再耗着了：每轮重试都要真花掉一次请求，空转没有意义。
+      transientAttempts = 0;
+      transientError = undefined;
+      log(`transient retry given up after ${attempt} attempt(s)`);
+      notify(ctx, `V2EX 上游连续 ${attempt} 次出错，已停止自动重试`, "warning");
+      return;
+    }
+
+    transientAttempts = attempt + 1;
+    const label = transientError?.label ?? "故障";
+    transientError = undefined;
+    const delay = errorRetryDelayMs(attempt);
+    armWait(ctx, Date.now() + delay, undefined, "error");
+    notify(
+      ctx,
+      `V2EX 上游${label}，${formatDuration(delay)} 后自动重试（第 ${transientAttempts} 次）`,
+      "info",
+    );
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -518,6 +662,11 @@ export default function (pi: ExtensionAPI) {
       selfResume = false;
       return;
     }
+    // 用户自己开口了，连续故障的账重新从零算起。
+    transientAttempts = 0;
+    transientAdvised = false;
+    transientHit = false;
+    transientError = undefined;
     if (pending) clearWait("用户已接管本轮", ctx);
   });
 
@@ -550,12 +699,26 @@ export default function (pi: ExtensionAPI) {
       }
       return;
     }
+    if (action === "retry") {
+      config = saveConfig(agentDir, { retryOnError: on });
+      transientAttempts = 0;
+      transientHit = false;
+      transientError = undefined;
+      if (!on) {
+        if (pending?.reason === "error") clearWait("上游故障重试已关闭", ctx);
+        notify(ctx, "上游故障自动重试已关闭", "info");
+        return;
+      }
+      const note = `5xx / 超时 / 连接中断时等 ${config.errorRetrySeconds}s 起退避重试，最多 ${config.maxErrorRetries} 次`;
+      notify(ctx, `上游故障自动重试已开启：${note}`, "info");
+      return;
+    }
     config = saveConfig(agentDir, { debug: on });
     notify(ctx, on ? `已开启调试日志：${join(agentDir, LOG_FILE)}` : "已关闭调试日志", "info");
   }
 
   pi.registerCommand("v2ex", {
-    description: "查看 V2EX AI Chat 配额，切换状态显示，手动排入或取消自动续跑",
+    description: "查看 V2EX AI Chat 配额，切换状态显示、自动续跑与上游故障重试，手动排入或取消等待",
     getArgumentCompletions: (prefix: string) => {
       const items = SUBCOMMANDS.filter((item) => item.value.startsWith(prefix));
       return items.length > 0 ? [...items] : null;
@@ -588,6 +751,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (action === "cancel") {
+        transientAttempts = 0;
+        transientHit = false;
+        transientError = undefined;
         if (!pending) {
           notify(ctx, "当前没有等待中的自动续跑", "info");
           return;
@@ -596,7 +762,7 @@ export default function (pi: ExtensionAPI) {
         notify(ctx, "已取消等待中的自动续跑", "info");
         return;
       }
-      if (action === "status" || action === "wait" || action === "debug") {
+      if (action === "status" || action === "wait" || action === "retry" || action === "debug") {
         if (value !== "on" && value !== "off") {
           notify(ctx, `用法：/v2ex ${action} on|off`, "warning");
           return;
@@ -606,7 +772,8 @@ export default function (pi: ExtensionAPI) {
       }
       notify(
         ctx,
-        `未知子命令：${action}（可用 refresh / start / cancel / status on|off / wait on|off / debug on|off）`,
+        `未知子命令：${action}（可用 refresh / start / cancel / status on|off / wait on|off` +
+          ` / retry on|off / debug on|off）`,
         "warning",
       );
     },

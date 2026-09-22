@@ -40,6 +40,10 @@ test("越界的数值被夹紧而不是报错", () => {
   assert.equal(normalizeConfig({ pollSeconds: 62.4 }).pollSeconds, 62);
   assert.equal(normalizeConfig({ maxResumeAttempts: 99 }).maxResumeAttempts, 10);
   assert.equal(normalizeConfig({ resumeBufferSeconds: -5 }).resumeBufferSeconds, 0);
+  assert.equal(normalizeConfig({ errorRetrySeconds: 0 }).errorRetrySeconds, 5);
+  assert.equal(normalizeConfig({ errorRetrySeconds: 99_999 }).errorRetrySeconds, 3_600);
+  assert.equal(normalizeConfig({ maxErrorRetries: 0 }).maxErrorRetries, 1);
+  assert.equal(normalizeConfig({ maxErrorRetries: 99 }).maxErrorRetries, 10);
   assert.equal(normalizeConfig({ pollSeconds: "60" }).pollSeconds, DEFAULT_CONFIG.pollSeconds);
 });
 
@@ -50,6 +54,10 @@ test("开关只认真正的布尔值", () => {
   assert.equal(normalizeConfig({ autoWait: true }).autoWait, true);
   assert.equal(normalizeConfig({ autoWait: "yes" }).autoWait, false);
   assert.equal(normalizeConfig({}).autoWait, false);
+  // 上游故障重试是额外能力，默认必须是关的。
+  assert.equal(normalizeConfig({}).retryOnError, false);
+  assert.equal(normalizeConfig({ retryOnError: true }).retryOnError, true);
+  assert.equal(normalizeConfig({ retryOnError: "on" }).retryOnError, false);
 });
 
 test("空的续跑文案退回默认值", () => {
@@ -105,6 +113,7 @@ test("等待计划的读写与清除", () => {
     attempts: 2,
     cwd: "E:/dev/pi",
     prompt: undefined,
+    reason: undefined,
   });
 
   writePending(dir, {
@@ -117,6 +126,38 @@ test("等待计划的读写与清除", () => {
 
   clearPending(dir);
   assert.equal(readPending(dir), undefined);
+});
+
+test("等待原因会落盘，缺省或非法值退回「等配额刷新」", () => {
+  const dir = tempDir();
+  writePending(dir, {
+    resumeAt: 1_790_075_684_000,
+    attempts: 1,
+    cwd: "E:/dev/pi",
+    reason: "error",
+  });
+  assert.equal(readPending(dir)?.reason, "error");
+
+  writePending(dir, {
+    resumeAt: 1_790_075_684_000,
+    attempts: 1,
+    cwd: "E:/dev/pi",
+    reason: "quota",
+  });
+  assert.equal(readPending(dir)?.reason, "quota");
+
+  // 更早版本写的计划文件里没有这个字段，不该被当成坏数据。
+  writeFileSync(
+    pendingPath(dir),
+    JSON.stringify({ resumeAt: 1_790_075_684_000, attempts: 0, cwd: "E:/dev/pi" }),
+  );
+  assert.equal(readPending(dir)?.reason, undefined);
+
+  writeFileSync(
+    pendingPath(dir),
+    JSON.stringify({ resumeAt: 1_790_075_684_000, attempts: 0, cwd: "E:/dev/pi", reason: "??" }),
+  );
+  assert.equal(readPending(dir)?.reason, undefined);
 });
 
 test("损坏的等待计划当作不存在", () => {

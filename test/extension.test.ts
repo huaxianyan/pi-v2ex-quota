@@ -165,7 +165,9 @@ function failingQuota(): () => void {
 }
 
 /** 读落盘的等待计划；没有就返回 undefined。 */
-function readPlan(dir: string): { resumeAt: number; attempts: number; prompt?: string } | undefined {
+function readPlan(
+  dir: string,
+): { resumeAt: number; attempts: number; prompt?: string; reason?: string } | undefined {
   try {
     return JSON.parse(readFileSync(join(dir, "v2ex-quota-pending.json"), "utf8"));
   } catch {
@@ -509,6 +511,193 @@ test("/v2ex start 在非交互模式下不排等待", async () => {
     ext.ctx.mode = "json";
     await ext.run("v2ex", "start");
     assert.equal(readPlan(ext.dir), undefined, "非交互模式下不该排等待");
+  } finally {
+    restore();
+  }
+});
+
+/** pi 把上游故障压成一句 errorMessage，这里照原样构造。 */
+function providerError(text: string) {
+  return {
+    type: "message_end",
+    message: { role: "assistant", stopReason: "error", errorMessage: text },
+  };
+}
+
+/** 实测原话：一次 Cloudflare 522 断掉整轮会话，pi 没有重试。 */
+const BAD_GATEWAY = "522 status code (no body)";
+const RESUME_PROMPT = "配额已刷新，继续完成任务。";
+
+test("上游 522 在开启重试后于本轮结束时刻排期", async () => {
+  const restore = stubQuota(
+    () => 4_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({ retryOnError: true, errorRetrySeconds: 60 });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(60);
+
+    await ext.emit("message_end", providerError(BAD_GATEWAY));
+    assert.equal(readPlan(ext.dir), undefined, "message_end 阶段不该抢在收尾前排期");
+
+    await ext.emit("agent_settled", { type: "agent_settled" });
+    const plan = readPlan(ext.dir);
+    assert.ok(plan, "没有排入重试");
+    assert.equal(plan.reason, "error");
+    const gap = plan.resumeAt - Date.now();
+    assert.ok(gap > 50_000 && gap < 70_000, `首次退避该是 errorRetrySeconds，实际 ${gap}ms`);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 重试 /);
+
+    const notes = ext.notifications.map((item) => item.message).join(" / ");
+    assert.ok(notes.includes("HTTP 522"), `通知里没说明故障：${notes}`);
+    assert.equal(ext.sent.length, 0, "排期时不该注入消息");
+  } finally {
+    restore();
+  }
+});
+
+test("关闭上游重试时只提示怎么开，不排期", async () => {
+  const restore = stubQuota(
+    () => 4_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({ retryOnError: false });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(60);
+
+    await ext.emit("message_end", providerError(BAD_GATEWAY));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+
+    assert.equal(readPlan(ext.dir), undefined, "开关关着就不该排期");
+    assert.equal(ext.sent.length, 0);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 50% · /);
+    assert.ok(
+      ext.notifications.some((item) => item.message.includes("/v2ex retry on")),
+      "没告诉用户怎么开启",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("上游故障到点续跑，连续故障时退避逐次翻倍", async () => {
+  const restore = stubQuota(
+    () => 4_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({
+      retryOnError: true,
+      errorRetrySeconds: 5,
+      maxErrorRetries: 3,
+    });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(60);
+
+    await ext.emit("message_end", providerError(BAD_GATEWAY));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+    assert.ok(readPlan(ext.dir), "第一次故障该排上重试");
+
+    await sleep(6_000);
+    assert.deepEqual(ext.sent, [RESUME_PROMPT], "到点没有注入续跑消息");
+
+    // 续跑又撞上同一个故障：这一轮该按翻倍后的间隔排。
+    await ext.emit("message_end", providerError(BAD_GATEWAY));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+    const second = readPlan(ext.dir);
+    assert.ok(second, "第二次故障该继续排期");
+    const gap = second.resumeAt - Date.now();
+    assert.ok(gap > 8_000 && gap < 16_000, `第二次退避该翻倍到约 10s，实际 ${gap}ms`);
+    assert.ok(
+      ext.notifications.some((item) => item.message.includes("第 2 次")),
+      `通知里没标次数：${ext.notifications.map((item) => item.message).join(" / ")}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("上游连续故障达到上限后停止自动重试", async () => {
+  const restore = stubQuota(
+    () => 4_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({
+      retryOnError: true,
+      errorRetrySeconds: 5,
+      maxErrorRetries: 1,
+    });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(60);
+
+    await ext.emit("message_end", providerError(BAD_GATEWAY));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+    assert.ok(readPlan(ext.dir), "第一次故障该排上重试");
+
+    await sleep(6_000);
+    assert.equal(ext.sent.length, 1, "到点该续跑一次");
+
+    await ext.emit("message_end", providerError(BAD_GATEWAY));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+
+    assert.equal(readPlan(ext.dir), undefined, "到上限后不该再排期");
+    assert.ok(
+      ext.notifications.some((item) => item.message.includes("已停止自动重试")),
+      `没提示停止：${ext.notifications.map((item) => item.message).join(" / ")}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("落盘的上游重试计划会在下次会话被恢复", async () => {
+  const restore = stubQuota(
+    () => 4_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({ retryOnError: true });
+    writeFileSync(
+      join(ext.dir, "v2ex-quota-pending.json"),
+      `${JSON.stringify(
+        { resumeAt: Date.now() - 1_000, attempts: 0, cwd: "E:/dev/pi", reason: "error" },
+        null,
+        2,
+      )}\n`,
+    );
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    // 恢复时会留 2 秒余量，免得和会话初始化抢时序。
+    await sleep(3_500);
+    assert.deepEqual(ext.sent, [RESUME_PROMPT], "恢复后到点没有续跑");
+    assert.equal(readPlan(ext.dir), undefined, "续跑后等待计划该被清掉");
+  } finally {
+    restore();
+  }
+});
+
+test("关掉上游重试后，落盘的重试计划不会被恢复", async () => {
+  const restore = stubQuota(
+    () => 4_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({ retryOnError: false });
+    writeFileSync(
+      join(ext.dir, "v2ex-quota-pending.json"),
+      `${JSON.stringify(
+        { resumeAt: Date.now() + 3_600_000, attempts: 0, cwd: "E:/dev/pi", reason: "error" },
+        null,
+        2,
+      )}\n`,
+    );
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(200);
+    assert.equal(readPlan(ext.dir), undefined, "开关关着就不该恢复计划");
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 50% · /);
+    assert.equal(ext.sent.length, 0);
   } finally {
     restore();
   }

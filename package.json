@@ -2,7 +2,7 @@
   "name": "pi-v2ex-quota",
   "version": "0.1.0",
   "private": true,
-  "description": "V2EX AI Chat 配额监视与自动续跑扩展（pi coding agent）",
+  "description": "V2EX AI Chat 配额监视，配额用尽与上游瞬断时自动续跑的 pi 扩展",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",
@@ -27,6 +27,7 @@
     "verify:rearm": "node tools/verify-resume.mjs --case rearm",
     "verify:start": "node tools/verify-resume.mjs --case start",
     "verify:start-live": "node tools/verify-resume.mjs --case start-live",
+    "verify:retry": "node tools/verify-resume.mjs --case retry",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {

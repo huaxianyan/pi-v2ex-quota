@@ -1,5 +1,5 @@
 /**
- * 真机自检：验证扩展在真实 pi 上的两条关键路径。
+ * 真机自检：验证扩展在真实 pi 上的关键路径。
  *
  * 这是 `npm test` 覆盖不到的一层 —— 单元测试用的是假 pi，证明的是扩展自己的逻辑；
  * 这里驱动的是真 pi 进程，证明的是扩展与 pi 生命周期的配合。
@@ -9,8 +9,9 @@
  *   node tools/verify-resume.mjs --case rearm # 用户接管本轮后，等待会不会重新排期
  *   node tools/verify-resume.mjs --case start # 已知额度用尽，/v2ex start 能不能直接排上
  *   node tools/verify-resume.mjs --case start-live # /v2ex start 排上后到点能不能真的接上
+ *   node tools/verify-resume.mjs --case retry # 上游 522 之后能不能按退避自动重试
  *
- * 四条路径都靠 `PI_CODING_AGENT_DIR` 把 agent 目录挪到临时目录，
+ * 五条路径都靠 `PI_CODING_AGENT_DIR` 把 agent 目录挪到临时目录，
  * 绝不碰你真实的配置与等待计划；跑完自动清理。
  */
 import { spawn } from "node:child_process";
@@ -556,6 +557,165 @@ async function caseStartLive(agentDir) {
   );
 }
 
+// ------------------------------------------------------------------ case: retry
+
+/**
+ * 假上游：配额接口正常，但补全接口固定返回 522。
+ *
+ * 522 是 Cloudflare 的「连接源站超时」，2026-09-22 那次真机故障就是这个码。
+ * 注意 pi 会把它压成一句 `Connection error.`，字面里看不出状态码 ——
+ * 扩展的故障分类必须认这句，否则整条路都不会被触发。
+ */
+function startFlakyProvider() {
+  const state = { completions: 0 };
+  const quota = () =>
+    JSON.stringify({
+      success: true,
+      message: "fake quota",
+      result: {
+        active: true,
+        total_tokens: 8_020_000,
+        used_tokens: 0,
+        remaining_tokens: 8_020_000,
+        used_percent: 0,
+        period_start: Math.floor(Date.now() / 1000) - 60,
+        period_end: Math.floor(Date.now() / 1000) + 3600,
+        extra_usage: { pack_count: 0, total_tokens: 0, used_tokens: 0, remaining_tokens: 0 },
+      },
+    });
+  const server = createServer((req, res) => {
+    if (req.url.startsWith("/api/v2/chat/quota")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(quota());
+      return;
+    }
+    state.completions += 1;
+    res.writeHead(522, { "content-type": "text/plain" });
+    res.end("");
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({ server, state, port: server.address().port }));
+  });
+}
+
+/**
+ * 场景：上游返回 522，整轮会话被打断。
+ *
+ * pi 自己会先做三次快速重试（2s / 4s / 8s 退避），每次都重跑一轮 agent，
+ * 全失败后才发 agent_settled。扩展接手的正是这个时点：按自己的退避再排一次，
+ * 到点把对话接上。单元测试里用的是假 pi，只有这里能证明它跟真 pi 合得上。
+ */
+async function caseRetry(agentDir) {
+  const fake = await startFlakyProvider();
+  const retrySeconds = 5;
+  prepareAgentDir(agentDir, `http://127.0.0.1:${fake.port}`, {
+    retryOnError: true,
+    errorRetrySeconds: retrySeconds,
+    maxErrorRetries: 2,
+    // 这个 case 只验上游故障那条路，别让配额续跑掺进来。
+    autoWait: false,
+    resumeBufferSeconds: 0,
+  });
+
+  console.log(`${stamp()} 假上游: http://127.0.0.1:${fake.port}（配额正常，补全固定 522）`);
+
+  const child = spawnPi(agentDir);
+  let agentStarts = 0;
+  let resumedText;
+  let buf = "";
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (d) => process.stdout.write(`${stamp()} [stderr] ${d}`));
+  child.stdout.on("data", (chunk) => {
+    buf += chunk;
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx).replace(/\r$/, "");
+      buf = buf.slice(idx + 1);
+      let ev;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (ev.type === "agent_start") {
+        agentStarts += 1;
+        console.log(`${stamp()} agent_start（第 ${agentStarts} 次）`);
+      } else if (ev.type === "auto_retry_start") {
+        console.log(
+          `${stamp()} pi 自己的重试：第 ${ev.attempt}/${ev.maxAttempts} 次，${ev.delayMs}ms 后`,
+        );
+      } else if (ev.type === "auto_retry_end") {
+        console.log(`${stamp()} pi 自己的重试结束：success=${ev.success}`);
+      } else if (ev.type === "message_end" && ev.message?.role === "user") {
+        const text = textOf(ev.message);
+        if (text.includes(RESUME_PROMPT)) {
+          resumedText = text;
+          console.log(`${stamp()} 会话内出现用户消息: ${JSON.stringify(text.slice(0, 60))}`);
+        }
+      }
+    }
+  });
+
+  const finish = (code, lines) => {
+    child.kill();
+    fake.server.close();
+    console.log(`\n${stamp()} --- 扩展调试日志 ---`);
+    process.stdout.write(readLog(agentDir));
+    console.log(`\n${lines}`);
+    return code;
+  };
+
+  // 阶段一：等配额快照落地，确认扩展已经就绪。
+  const snapshot = await waitForLog(agentDir, (text) => text.includes("quota: active="), 30_000);
+  if (!snapshot) return finish(1, "失败：拿不到假配额快照");
+
+  console.log(`${stamp()} 发一条消息，上游会返回 522`);
+  child.stdin.write(`${JSON.stringify({ type: "prompt", message: "hi" })}\n`);
+
+  // 阶段二：pi 自己重试三次要花掉约 55 秒，扩展在 agent_settled 之后才排期。
+  const armed = await waitForLog(
+    agentDir,
+    (text) => {
+      const match = /wait armed: resume at (\S+) \((error|quota), in (.+?)\)/.exec(text);
+      return match ? { iso: match[1], reason: match[2], delay: match[3] } : undefined;
+    },
+    120_000,
+  );
+  if (!armed) return finish(1, "失败：上游 522 之后没有排入重试");
+
+  const plan = readPlanFile(agentDir);
+  const planOk = plan?.reason === "error";
+  const gapMs = Date.parse(armed.hit.iso) - Date.now();
+  // 排期发生在 agent_settled 那一刻，到这里已经过了一小会儿，所以只校验量级。
+  const backoffOk = gapMs > 0 && gapMs <= retrySeconds * 1000;
+  console.log(
+    `${stamp()} 已排期: ${armed.hit.iso}（${armed.hit.delay} 后，reason=${armed.hit.reason}）`,
+  );
+
+  // 阶段三：到点真的把对话接上。
+  const startsBeforeResume = agentStarts;
+  const resumed = await waitForLog(
+    agentDir,
+    (text) => text.includes("resume: injecting continuation (error)"),
+    60_000,
+  );
+  await sleep(3_000);
+
+  const restarted = agentStarts > startsBeforeResume;
+  const pass = planOk && backoffOk && resumed !== undefined && restarted && resumedText !== undefined;
+  return finish(
+    pass ? 0 : 1,
+    [
+      `计划 reason=error=${planOk}（值 ${plan?.reason}）退避约 ${Math.round(gapMs / 1000)}s=${backoffOk}`,
+      `到点注入=${resumed !== undefined} 注入后又起一轮=${restarted}` +
+        `（${startsBeforeResume} → ${agentStarts}）续跑消息进入会话=${resumedText !== undefined}`,
+      `\n${pass ? "通过" : "失败"}：上游 522 之后扩展按退避重试并把对话接上了`,
+    ].join("\n"),
+  );
+}
+
 // ---------------------------------------------------------------------- 入口
 
 const sandbox = join(tmpdir(), `pi-v2ex-verify-${Date.now()}`);
@@ -570,8 +730,12 @@ try {
     process.exitCode = await caseStart(agentDir);
   } else if (CASE === "start-live") {
     process.exitCode = await caseStartLive(agentDir);
+  } else if (CASE === "retry") {
+    process.exitCode = await caseRetry(agentDir);
   } else {
-    console.error(`未知的 case：${CASE}（可用 resume / rearm / start / start-live）`);
+    console.error(
+      `未知的 case：${CASE}（可用 resume / rearm / start / start-live / retry）`,
+    );
     process.exitCode = 2;
   }
 } finally {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  classifyTransientError,
   fetchQuota,
   isExhausted,
   isQuotaExhaustedSignal,
@@ -183,4 +184,39 @@ test("fetchQuota 在非 2xx 时抛错", async () => {
     fetchQuota({ baseUrl: "https://edge.v2ex.com/chat/v1", apiKey: "t" }, { fetchImpl }),
     /HTTP 500/,
   );
+});
+
+test("上游瞬时故障的识别：只认值得重试的那几类", () => {
+  // 实测原话：Cloudflare 522 被 pi 压成「522 status code (no body)」。
+  assert.deepEqual(classifyTransientError("522 status code (no body)"), {
+    kind: "server",
+    status: 522,
+    label: "HTTP 522",
+  });
+  assert.equal(classifyTransientError("503 status code (no body)")?.kind, "server");
+  // 别的客户端会把状态码写成别的语序，认得出就行。
+  assert.equal(classifyTransientError("HTTP 502 Bad Gateway")?.status, 502);
+  assert.equal(classifyTransientError("Request failed with status code 503")?.kind, "server");
+  // 每分钟限流也是「等一会儿再来」，值得重试；配额用尽在下面单独排除。
+  assert.equal(classifyTransientError("429 status code (no body)")?.status, 429);
+  assert.equal(classifyTransientError("Request timed out")?.kind, "timeout");
+  assert.equal(classifyTransientError("connect ETIMEDOUT 1.2.3.4:443")?.kind, "network");
+  assert.equal(classifyTransientError("fetch failed")?.kind, "network");
+  assert.equal(classifyTransientError("read ECONNRESET")?.kind, "network");
+  assert.equal(classifyTransientError("socket hang up")?.kind, "network");
+  // pi 对连不上的 provider 会直接说 Connection error.，字面里什么细节都没有。
+  assert.equal(classifyTransientError("Connection error.")?.kind, "network");
+  // 端口号长得像状态码（5000），没有 HTTP 语境就不该当成状态码。
+  assert.equal(classifyTransientError("connect ECONNREFUSED 127.0.0.1:5000")?.kind, "network");
+});
+
+test("上游瞬时故障的识别：不该重试的一律返回 undefined", () => {
+  // 配额用尽归 autoWait 管，走到这里会变成「等 5 小时再重试」，必须挡住。
+  assert.equal(classifyTransientError("quota exhausted"), undefined);
+  assert.equal(classifyTransientError("429 insufficient_quota"), undefined);
+  // 请求本身有问题，重试只会白等。
+  assert.equal(classifyTransientError("400 status code (no body)"), undefined);
+  assert.equal(classifyTransientError("401 unauthorized"), undefined);
+  assert.equal(classifyTransientError("404 status code (no body)"), undefined);
+  assert.equal(classifyTransientError("模型返回了无法解析的内容"), undefined);
 });

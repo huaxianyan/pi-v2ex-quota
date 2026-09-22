@@ -110,6 +110,7 @@ test("详情面板列出窗口用量与重置时间", () => {
     now: NOW,
     waiting: true,
     autoWaitLabel: "已开启（2h 后继续）",
+    retryOnErrorLabel: "已关闭",
   });
   const text = lines.join("\n");
   assert.match(text, /窗口已用 1K \/ 1K/);
@@ -117,6 +118,7 @@ test("详情面板列出窗口用量与重置时间", () => {
   assert.match(text, /重置 .*（2h 后）/);
   assert.match(text, /正在等待刷新后自动续跑/);
   assert.match(text, /自动续跑：已开启（2h 后继续）/);
+  assert.match(text, /上游重试：已关闭/);
 });
 
 test("详情面板在无窗口时说明下一条消息开新窗口", () => {
@@ -125,8 +127,13 @@ test("详情面板在无窗口时说明下一条消息开新窗口", () => {
     now: NOW,
     waiting: false,
     autoWaitLabel: "已关闭",
+    retryOnErrorLabel: "已开启",
   });
-  assert.match(lines.join("\n"), /没有有效窗口/);
+  const text = lines.join("\n");
+  assert.match(text, /没有有效窗口/);
+  // 两个开关在任何状态下都要看得见，否则「现在到底开没开」就得猜。
+  assert.match(text, /自动续跑：已关闭/);
+  assert.match(text, /上游重试：已开启/);
 });
 
 test("详情面板在无数据时提示刷新", () => {
@@ -135,6 +142,59 @@ test("详情面板在无数据时提示刷新", () => {
     now: NOW,
     waiting: false,
     autoWaitLabel: "已关闭",
+    retryOnErrorLabel: "已关闭",
   });
   assert.match(lines.join("\n"), /\/v2ex refresh/);
+});
+
+test("上游故障等待时状态栏说重试，并带上剩余时间", () => {
+  const view = buildStatus({
+    window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
+    now: NOW,
+    waiting: true,
+    waitReason: "error",
+    resumeAt: NOW + 45_000,
+  });
+  assert.equal(view.text, "v2ex 重试 45s");
+  assert.equal(view.level, "waiting");
+});
+
+test("上游故障等待时额度还有量，也不显示成百分比", () => {
+  const view = buildStatus({
+    window: windowOf({ usedPercent: 10, remainingTokens: 900 }),
+    now: NOW,
+    waiting: true,
+    waitReason: "error",
+    resumeAt: NOW + 120_000,
+  });
+  assert.equal(view.text, "v2ex 重试 2m");
+});
+
+test("等待时刻以排期为准，不再是窗口重置时间", () => {
+  // quota 等待的 resumeAt 含缓冲秒数，比窗口重置略晚一点。
+  const view = buildStatus({
+    window: windowOf({ usedPercent: 100, usedTokens: 1_000, remainingTokens: 0 }),
+    now: NOW,
+    waiting: true,
+    waitReason: "quota",
+    resumeAt: NOW + 3_600_000 + 20_000,
+  });
+  assert.equal(view.text, "v2ex 等待 1h");
+});
+
+test("详情面板会说明上游故障重试的到点时间", () => {
+  const lines = buildDetails({
+    window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
+    now: NOW,
+    waiting: true,
+    waitReason: "error",
+    resumeAt: NOW + 45_000,
+    autoWaitLabel: "已开启",
+    retryOnErrorLabel: "已开启（45s 后重试）",
+  });
+  const text = lines.join("\n");
+  assert.match(text, /上游故障，45s 后自动重试/);
+  assert.match(text, /上游重试：已开启（45s 后重试）/);
+  // 额度还有量，就不该出现「配额已用尽」这类误导。
+  assert.doesNotMatch(text, /配额已用尽/);
 });

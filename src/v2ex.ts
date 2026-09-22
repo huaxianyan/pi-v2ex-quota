@@ -91,6 +91,74 @@ export function isQuotaExhaustedSignal(
   return remaining === 0;
 }
 
+/**
+ * 上游瞬时故障的类别。只有「再试一次有可能成」的错误才值得等：
+ * 服务端错了、请求超时了、连接断了。
+ */
+export type TransientErrorKind = "server" | "timeout" | "network";
+
+export interface TransientError {
+  kind: TransientErrorKind;
+  /** HTTP 状态码，仅 kind 为 server 时有值。 */
+  status?: number;
+  /** 通知与状态栏里用的简短描述。 */
+  label: string;
+}
+
+/** 429 是「等一会儿再来」，不是「服务端坏了」。 */
+const RATE_LIMIT_STATUS = 429;
+
+/**
+ * HTTP 状态码必须带语境才认。pi 的报错形如 `522 status code (no body)`，
+ * 别处可能是 `HTTP 502` 或 `status code 500`。
+ *
+ * 之所以不直接抓三位数：错误文案里常混着端口号（443）之类的数字，
+ * 光看形状会把 `connect ETIMEDOUT 1.2.3.4:443` 认成 HTTP 443，
+ * 于是把一条本该重试的连接超时错判成「请求有问题，不重试」。
+ */
+const HTTP_STATUS_PATTERN =
+  /(?:^|[^\d])([45]\d{2})\s+status\s+code\b|\bstatus\s*code[:\s]+([45]\d{2})\b|\bHTTP\/?[\d.]*\s+([45]\d{2})\b/i;
+
+const TIMEOUT_PATTERN = /timeout|timed out/i;
+/**
+ * 连接层面的中断。
+ *
+ * 除了 unix 错误码，还要认 pi 自己的措辞：provider 连接不上（含 522 这种空 body
+ * 的响应）时，pi 会把它压成一句 `Connection error.`，字面里没有任何细节。
+ * ETIMEDOUT 归这里而不是超时那条：它是 socket 层的连接超时，
+ * 与「请求发出去了但对方没回」不是一回事。注意 ETIMEDOUT 里并没有连续的
+ * TIMEOUT 子串（中间隔着 D），不会被上面那条吃掉。
+ */
+const NETWORK_PATTERN =
+  /ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|other side closed|UND_ERR_|connection error|network error/i;
+
+function httpStatusFromMessage(message: string): number | undefined {
+  const match = HTTP_STATUS_PATTERN.exec(message);
+  const raw = match?.[1] ?? match?.[2] ?? match?.[3];
+  return raw === undefined ? undefined : Number(raw);
+}
+
+/**
+ * 从 pi 压平的 errorMessage 里判断这是不是一次值得重试的上游故障。
+ *
+ * pi 把 provider 报错收敛成一句话，例如 `522 status code (no body)`、
+ * `Request timed out`。4xx 里除了限流都是请求本身的问题，重试只会白等，
+ * 所以直接返回 undefined。
+ */
+export function classifyTransientError(message: string): TransientError | undefined {
+  if (QUOTA_EXHAUSTED_PATTERN.test(message)) return undefined;
+  const status = httpStatusFromMessage(message);
+  if (status !== undefined) {
+    if (status === RATE_LIMIT_STATUS || status >= 500) {
+      return { kind: "server", status, label: `HTTP ${status}` };
+    }
+    return undefined;
+  }
+  if (TIMEOUT_PATTERN.test(message)) return { kind: "timeout", label: "请求超时" };
+  if (NETWORK_PATTERN.test(message)) return { kind: "network", label: "连接中断" };
+  return undefined;
+}
+
 /** 窗口与额外用量都见底，才是真的没得用。 */
 export function isExhausted(window: QuotaWindow | undefined): boolean {
   if (!window) return false;

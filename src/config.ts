@@ -23,6 +23,16 @@ export interface QuotaConfig {
   status: boolean;
   /** 配额用尽时不结束任务，等到窗口刷新后自动继续。 */
   autoWait: boolean;
+  /**
+   * 上游 5xx / 超时 / 连接中断等瞬时故障时，等待一段时间后自动重试。
+   * 这是相对 autoWait 的额外能力，默认关闭：网络抖一下就自动重发消息，
+   * 对多数人来说是意外行为，得显式开启。
+   */
+  retryOnError: boolean;
+  /** 上游故障后的首次重试等待秒数，之后按次数指数退避。 */
+  errorRetrySeconds: number;
+  /** 连续重试次数上限；一次成功响应或用户接管本轮都会清零。 */
+  maxErrorRetries: number;
   /** 状态栏刷新间隔（秒），同时也是后台轮询间隔。 */
   pollSeconds: number;
   /** 到达重置时间后再多等几秒，避免服务端时间与本地时钟的偏差。 */
@@ -42,6 +52,9 @@ export interface QuotaConfig {
 export const DEFAULT_CONFIG: QuotaConfig = {
   status: true,
   autoWait: false,
+  retryOnError: false,
+  errorRetrySeconds: 60,
+  maxErrorRetries: 3,
   pollSeconds: 60,
   resumeBufferSeconds: 20,
   maxResumeAttempts: 3,
@@ -50,6 +63,12 @@ export const DEFAULT_CONFIG: QuotaConfig = {
   apiKey: undefined,
   debug: false,
 };
+
+/**
+ * 这次等待在等什么：配额窗口刷新（quota），还是上游故障后的重试（error）。
+ * 两者的到点行为不同 —— 前者要先复核额度，后者直接续跑。
+ */
+export type WaitReason = "quota" | "error";
 
 export interface PendingResume {
   /** 计划续跑的时刻（毫秒时间戳）。 */
@@ -60,6 +79,8 @@ export interface PendingResume {
   cwd: string;
   /** 本次续跑注入的消息，缺省时用配置里的 resumePrompt。 */
   prompt?: string;
+  /** 等待原因。缺省视为等配额刷新，兼容更早版本留下的计划文件。 */
+  reason?: WaitReason;
 }
 
 export function configPath(agentDir: string): string {
@@ -82,6 +103,10 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+function optionalWaitReason(value: unknown): WaitReason | undefined {
+  return value === "quota" || value === "error" ? value : undefined;
+}
+
 /** 把任意来源的对象收敛成合法配置，越界的值就地夹紧而不是报错。 */
 export function normalizeConfig(raw: unknown): QuotaConfig {
   const source = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
@@ -89,6 +114,14 @@ export function normalizeConfig(raw: unknown): QuotaConfig {
   return {
     status: source["status"] === undefined ? DEFAULT_CONFIG.status : source["status"] === true,
     autoWait: source["autoWait"] === undefined ? DEFAULT_CONFIG.autoWait : source["autoWait"] === true,
+    retryOnError: source["retryOnError"] === true,
+    errorRetrySeconds: clampInt(
+      source["errorRetrySeconds"],
+      5,
+      3600,
+      DEFAULT_CONFIG.errorRetrySeconds,
+    ),
+    maxErrorRetries: clampInt(source["maxErrorRetries"], 1, 10, DEFAULT_CONFIG.maxErrorRetries),
     pollSeconds: clampInt(source["pollSeconds"], 15, 3600, DEFAULT_CONFIG.pollSeconds),
     resumeBufferSeconds: clampInt(
       source["resumeBufferSeconds"],
@@ -152,6 +185,7 @@ export function readPending(agentDir: string): PendingResume | undefined {
     attempts: clampInt(source["attempts"], 0, 10, 0),
     cwd: typeof source["cwd"] === "string" ? source["cwd"] : "",
     prompt: optionalString(source["prompt"]),
+    reason: optionalWaitReason(source["reason"]),
   };
 }
 
