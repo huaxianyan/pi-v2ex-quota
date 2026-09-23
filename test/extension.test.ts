@@ -220,7 +220,32 @@ test("session_start 后状态栏显示配额", async () => {
     await sleep(80);
     const status = ext.statuses.get(STATUS_KEY);
     assert.ok(status, "状态栏没有写入配额");
-    assert.match(status, /^v2ex 100% · /);
+    assert.match(status, /^V2EX ████████ 100% · /);
+  } finally {
+    restore();
+  }
+});
+
+test("改开关后状态栏立刻反映，不等下一次轮询", async () => {
+  const restore = stubQuota(
+    () => 8_000_000,
+    () => Date.now() + 3_600_000,
+  );
+  try {
+    const ext = await startExtension({ status: true });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(80);
+    // 测试台的轮询间隔是 3600 秒，所以这一行只可能由开关自己触发刷新。
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 关 · 代理 关$/);
+
+    await ext.run("v2ex", "wait on");
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 关 · 代理 关$/);
+
+    await ext.run("v2ex", "retry on");
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 开 · 代理 关$/);
+
+    await ext.run("v2ex", "wait off");
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 开 · 代理 关$/);
   } finally {
     restore();
   }
@@ -241,7 +266,7 @@ test("配额用尽时立刻中止本轮并提示", async () => {
     assert.ok(ext.notifications.some((item) => item.message.includes("配额已用尽")));
     assert.ok(ext.notifications.some((item) => item.message.includes("wait on")));
     assert.equal(ext.sent.length, 0, "未开启自动续跑时不该注入消息");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 0% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ░░░░░░░░ 0% · /);
   } finally {
     restore();
   }
@@ -281,13 +306,13 @@ test("开启自动续跑后，窗口刷新即注入续跑消息", async () => {
 
     remaining = 8_000_000;
     await ext.emit("agent_settled", { type: "agent_settled" });
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 等待 /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 /);
 
     await sleep(1_500);
     assert.equal(ext.sent.length, 1, "没有注入续跑消息");
     assert.equal(ext.sent[0], "配额已刷新，继续完成任务。");
     assert.ok(ext.notifications.some((item) => item.message.includes("已刷新")));
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 100% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████████ 100% · /);
   } finally {
     restore();
   }
@@ -329,10 +354,10 @@ test("用户自己发消息会取消等待中的自动续跑", async () => {
     await ext.emit("session_start", { type: "session_start", reason: "startup" });
     await ext.emit("after_provider_response", exhaustedResponse(Date.now() + 3_600_000));
     await ext.emit("agent_settled", { type: "agent_settled" });
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 等待 /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 /);
 
     await ext.emit("before_agent_start", { type: "before_agent_start", prompt: "换个任务" });
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 0% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ░░░░░░░░ 0% · /);
 
     await sleep(60);
     assert.equal(ext.sent.length, 0);
@@ -354,7 +379,7 @@ test("/v2ex start 在配额已用尽时立即排入等待", async () => {
 
     // 关键差异：会话里没有任何 agent 轮次，纯粹靠命令排队。
     await ext.run("v2ex", "start");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 等待 /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 /);
     assert.ok(
       ext.notifications.some((item) => item.message.includes("已排入自动续跑")),
       `未提示排期：${ext.notifications.map((item) => item.message).join(" / ")}`,
@@ -366,7 +391,7 @@ test("/v2ex start 在配额已用尽时立即排入等待", async () => {
     await sleep(2_200);
     assert.equal(ext.sent.length, 1, `没有注入续跑消息：${JSON.stringify(ext.sent)}`);
     assert.equal(ext.sent[0], "配额已刷新，继续完成任务。");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 100% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████████ 100% · /);
     assert.equal(readPlan(ext.dir), undefined, "续跑后等待计划该被清掉");
   } finally {
     restore();
@@ -408,7 +433,7 @@ test("/v2ex start 在仍有额度时不排等待", async () => {
       `未说明仍有额度：${ext.notifications.map((item) => item.message).join(" / ")}`,
     );
     assert.equal(readPlan(ext.dir), undefined, "有用量时不该排等待");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 50% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████░░░░ 50% · /);
   } finally {
     restore();
   }
@@ -477,6 +502,9 @@ test("/v2ex start 会顺带打开自动续跑开关", async () => {
       ext.notifications.some((item) => item.message.includes("自动续跑开关已一并开启")),
       `未说明开关变化：${ext.notifications.map((item) => item.message).join(" / ")}`,
     );
+    // 开关状态要当场反映到状态栏上，否则「刚才那下到底改没改」还得再敲一条命令确认。
+    const status = ext.statuses.get(STATUS_KEY) ?? "";
+    assert.match(status, /\| 续跑 开 · 重试 关 · 代理 关/, `状态栏没带上配置段：${status}`);
   } finally {
     restore();
   }
@@ -550,7 +578,7 @@ test("上游 522 在开启重试后于本轮结束时刻排期", async () => {
     assert.equal(plan.reason, "error");
     const gap = plan.resumeAt - Date.now();
     assert.ok(gap > 50_000 && gap < 70_000, `首次退避该是 errorRetrySeconds，实际 ${gap}ms`);
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 重试 /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 重试 /);
 
     const notes = ext.notifications.map((item) => item.message).join(" / ");
     assert.ok(notes.includes("HTTP 522"), `通知里没说明故障：${notes}`);
@@ -575,7 +603,7 @@ test("关闭上游重试时只提示怎么开，不排期", async () => {
 
     assert.equal(readPlan(ext.dir), undefined, "开关关着就不该排期");
     assert.equal(ext.sent.length, 0);
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 50% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████░░░░ 50% · /);
     assert.ok(
       ext.notifications.some((item) => item.message.includes("/v2ex retry on")),
       "没告诉用户怎么开启",
@@ -699,7 +727,7 @@ test("关掉上游重试后，落盘的重试计划不会被恢复", async () =>
     await ext.emit("session_start", { type: "session_start", reason: "startup" });
     await sleep(200);
     assert.equal(readPlan(ext.dir), undefined, "开关关着就不该恢复计划");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 50% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████░░░░ 50% · /);
     assert.equal(ext.sent.length, 0);
   } finally {
     restore();
@@ -782,32 +810,60 @@ test("/v2ex proxy 设置后，配额查询真的从代理走", async () => {
     await sleep(80);
     // 没配代理时是直连，代理这边不该有任何记录。
     assert.deepEqual(chain.connects, [], "没配代理就不该走代理");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^v2ex 50% · /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████░░░░ 50% · /);
 
-    await ext.run("v2ex", `proxy http://127.0.0.1:${chain.proxyPort}`);
-    assert.equal(loadConfig(ext.dir).proxy, `http://127.0.0.1:${chain.proxyPort}`);
-    assert.deepEqual(chain.connects, [`127.0.0.1:${chain.targetPort}`], "设置后没走代理");
+    // 只写主机端口 —— 协议由探测决定，探测通了才认这个设置。
+    await ext.run("v2ex", `proxy 127.0.0.1:${chain.proxyPort}`);
+    assert.equal(
+      loadConfig(ext.dir).proxy,
+      `http://127.0.0.1:${chain.proxyPort}`,
+      "探测出来的协议该写回配置，下次就不必再试",
+    );
+    // 一次是探测建的隧道，一次是设置后的立即查询。
+    assert.deepEqual(
+      chain.connects,
+      [`127.0.0.1:${chain.targetPort}`, `127.0.0.1:${chain.targetPort}`],
+      "设置后没走代理",
+    );
     assert.ok(
       ext.notifications.some((item) => item.message.includes("连接正常")),
       `没报连接正常：${ext.notifications.map((item) => item.message).join(" / ")}`,
     );
+    // 状态栏只报开关，不回显地址。
+    const withProxy = ext.statuses.get(STATUS_KEY) ?? "";
+    assert.ok(withProxy.includes("代理 开"), `状态栏没显示代理已开：${withProxy}`);
+    assert.doesNotMatch(withProxy, new RegExp(String(chain.proxyPort)), "状态栏不该出现代理端口");
 
     await ext.run("v2ex", "proxy off");
     assert.equal(loadConfig(ext.dir).proxy, "");
-    assert.equal(chain.connects.length, 1, "关掉代理后不该再走代理");
+    assert.equal(chain.connects.length, 2, "关掉代理后不该再走代理");
+    assert.match(
+      ext.statuses.get(STATUS_KEY) ?? "",
+      /代理 关/,
+      "关掉代理后状态栏该回到「关」",
+    );
   } finally {
     await chain.close();
   }
 });
 
-test("/v2ex proxy 拒绝无法识别的地址，且不动已有配置", async () => {
+test("/v2ex proxy 拒绝认不出的地址与连不通的地址，且不动已有配置", async () => {
   const ext = await startExtension({ proxy: "http://127.0.0.1:1" });
 
-  await ext.run("v2ex", "proxy socks5://127.0.0.1:1080");
+  // 认不出的协议：当场告知，不静默直连也不静默存下。
+  await ext.run("v2ex", "proxy https://127.0.0.1:8443");
   assert.equal(loadConfig(ext.dir).proxy, "http://127.0.0.1:1", "非法值不该覆盖已有配置");
   assert.ok(
     ext.notifications.some((item) => item.message.includes("无法识别")),
     `没提示地址非法：${ext.notifications.map((item) => item.message).join(" / ")}`,
+  );
+
+  // 地址格式没问题但三种协议都连不通：同样算设置失败。
+  await ext.run("v2ex", "proxy 127.0.0.1:1");
+  assert.equal(loadConfig(ext.dir).proxy, "http://127.0.0.1:1", "连不通的地址不该写进配置");
+  assert.ok(
+    ext.notifications.some((item) => item.message.includes("设置失败")),
+    `没提示设置失败：${ext.notifications.map((item) => item.message).join(" / ")}`,
   );
 
   // 不带参数就是把当前值报出来。

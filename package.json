@@ -28,6 +28,7 @@
     "verify:start": "node tools/verify-resume.mjs --case start",
     "verify:start-live": "node tools/verify-resume.mjs --case start-live",
     "verify:retry": "node tools/verify-resume.mjs --case retry",
+    "verify:proxy": "node tools/verify-resume.mjs --case proxy",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {

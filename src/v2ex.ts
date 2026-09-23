@@ -181,6 +181,19 @@ export function quotaUrl(baseUrl: string): string {
   return new URL(QUOTA_PATH, new URL(baseUrl).origin).toString();
 }
 
+/** 读不到 provider 时的兜底入口，只在「探测代理该连哪儿」时用得上。 */
+export const FALLBACK_BASE_URL = "https://edge.v2ex.com";
+
+/**
+ * 取一个 baseUrl 的主机与端口，给代理探测当目标。
+ * URL 会把 IPv6 字面量裹在方括号里，交给 net 之前要脱掉。
+ */
+export function originTarget(baseUrl: string): { host: string; port: number } {
+  const url = new URL(baseUrl);
+  const port = url.port.length > 0 ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  return { host: url.hostname.replace(/^\[|\]$/g, ""), port };
+}
+
 /** 解析 models.json 里的 apiKey 写法：字面量、$VAR 或 ${VAR}。 */
 export function resolveApiKey(raw: string, env: Record<string, string | undefined>): string {
   const braced = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(raw.trim());
