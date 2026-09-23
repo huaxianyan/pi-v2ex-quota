@@ -9,8 +9,6 @@
  * - 配额用尽时新消息收到 429，body 为 rate_limit_error / rate_limit_exceeded。
  */
 
-import { createFetch } from "./proxy.ts";
-
 export const QUOTA_PATH = "/api/v2/chat/quota";
 
 export const TOKEN_LIMIT_HEADER = "x-ai-chat-token-limit";
@@ -181,19 +179,6 @@ export function quotaUrl(baseUrl: string): string {
   return new URL(QUOTA_PATH, new URL(baseUrl).origin).toString();
 }
 
-/** 读不到 provider 时的兜底入口，只在「探测代理该连哪儿」时用得上。 */
-export const FALLBACK_BASE_URL = "https://edge.v2ex.com";
-
-/**
- * 取一个 baseUrl 的主机与端口，给代理探测当目标。
- * URL 会把 IPv6 字面量裹在方括号里，交给 net 之前要脱掉。
- */
-export function originTarget(baseUrl: string): { host: string; port: number } {
-  const url = new URL(baseUrl);
-  const port = url.port.length > 0 ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
-  return { host: url.hostname.replace(/^\[|\]$/g, ""), port };
-}
-
 /** 解析 models.json 里的 apiKey 写法：字面量、$VAR 或 ${VAR}。 */
 export function resolveApiKey(raw: string, env: Record<string, string | undefined>): string {
   const braced = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(raw.trim());
@@ -262,16 +247,22 @@ export function parseQuotaResponse(raw: unknown): QuotaWindow {
 
 export interface FetchQuotaOptions {
   timeoutMs?: number;
+  /** 替掉全局 fetch，测试里塞假接口用。 */
   fetchImpl?: typeof fetch;
-  /** 走本地 HTTP 代理查询；空或未设置表示直连。 */
-  proxy?: string;
 }
 
+/**
+ * 查询配额。
+ *
+ * 走全局 fetch 而不是自己另起一套：pi 启动时已经把 `globalThis.fetch` 换成带
+ * `EnvHttpProxyAgent` 的 undici 版，`HTTP_PROXY` / `HTTPS_PROXY`（或 pi 的
+ * `httpProxy` 设置）在它那里自然生效 —— 扩展不必、也不该自己管出网代理。
+ */
 export async function fetchQuota(
   endpoint: V2exEndpoint,
   options: FetchQuotaOptions = {},
 ): Promise<QuotaWindow> {
-  const doFetch = options.fetchImpl ?? createFetch(options.proxy);
+  const doFetch = options.fetchImpl ?? fetch;
   const response = await doFetch(quotaUrl(endpoint.baseUrl), {
     headers: { Authorization: `Bearer ${endpoint.apiKey}` },
     signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),

@@ -1,8 +1,5 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer as createHttpServer } from "node:http";
-import { connect as netConnect } from "node:net";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -260,16 +257,16 @@ test("改开关后状态栏立刻反映，不等下一次轮询", async () => {
     await ext.emit("session_start", { type: "session_start", reason: "startup" });
     await sleep(80);
     // 测试台的轮询间隔是 3600 秒，所以这一行只可能由开关自己触发刷新。
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 关 · 代理 关$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 关$/);
 
     await ext.run("v2ex", "wait on");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 关 · 代理 关$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 关$/);
 
     await ext.run("v2ex", "retry on");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 开 · 代理 关$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 开$/);
 
     await ext.run("v2ex", "wait off");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 开 · 代理 关$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 开$/);
   } finally {
     restore();
   }
@@ -630,7 +627,7 @@ test("/v2ex start 会顺带打开自动续跑开关", async () => {
     );
     // 开关状态要当场反映到状态栏上，否则「刚才那下到底改没改」还得再敲一条命令确认。
     const status = ext.statuses.get(STATUS_KEY) ?? "";
-    assert.match(status, /\| 续跑 开 · 重试 关 · 代理 关/, `状态栏没带上配置段：${status}`);
+    assert.match(status, /\| 续跑 开 · 重试 关/, `状态栏没带上配置段：${status}`);
   } finally {
     restore();
   }
@@ -858,173 +855,4 @@ test("关掉上游重试后，落盘的重试计划不会被恢复", async () =>
   } finally {
     restore();
   }
-});
-
-/**
- * 本机假配额服务 + 只做转发的 CONNECT 代理。
- *
- * 用来验证「配了代理之后，扩展的查询真的从代理出去了」——
- * 光断言配置落盘证明不了这一点，那只能说明文件写对了。
- */
-async function startProxyChain(): Promise<{
-  targetPort: number;
-  proxyPort: number;
-  connects: string[];
-  close: () => Promise<void>;
-}> {
-  const target = createHttpServer((_req, res) => {
-    const now = Math.floor(Date.now() / 1000);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        success: true,
-        result: {
-          active: true,
-          total_tokens: 8_000_000,
-          used_tokens: 4_000_000,
-          remaining_tokens: 4_000_000,
-          used_percent: 50,
-          period_start: now - 1_000,
-          period_end: now + 3_600,
-          extra_usage: { remaining_tokens: 0 },
-        },
-      }),
-    );
-  });
-  await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", () => resolve()));
-  const targetPort = (target.address() as AddressInfo).port;
-
-  const connects: string[] = [];
-  const proxy = createHttpServer((_req, res) => {
-    res.writeHead(400).end("只接受 CONNECT");
-  });
-  proxy.on("connect", (req, clientSocket, head) => {
-    connects.push(req.url ?? "");
-    const upstream = netConnect(targetPort, "127.0.0.1", () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length > 0) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
-    upstream.on("error", () => clientSocket.destroy());
-    clientSocket.on("error", () => upstream.destroy());
-  });
-  await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
-  const proxyPort = (proxy.address() as AddressInfo).port;
-
-  return {
-    targetPort,
-    proxyPort,
-    connects,
-    async close() {
-      target.closeAllConnections();
-      await new Promise<void>((resolve) => target.close(() => resolve()));
-      proxy.closeAllConnections();
-      await new Promise<void>((resolve) => proxy.close(() => resolve()));
-    },
-  };
-}
-
-test("/v2ex proxy 设置后，配额查询真的从代理走", async () => {
-  const chain = await startProxyChain();
-  try {
-    const ext = await startExtension({
-      baseUrl: `http://127.0.0.1:${chain.targetPort}`,
-      apiKey: "k",
-    });
-    await ext.emit("session_start", { type: "session_start", reason: "startup" });
-    await sleep(80);
-    // 没配代理时是直连，代理这边不该有任何记录。
-    assert.deepEqual(chain.connects, [], "没配代理就不该走代理");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████░░░░ 50% · /);
-
-    // 只写主机端口 —— 协议由探测决定，探测通了才认这个设置。
-    await ext.run("v2ex", `proxy 127.0.0.1:${chain.proxyPort}`);
-    assert.equal(
-      loadConfig(ext.dir).proxy,
-      `http://127.0.0.1:${chain.proxyPort}`,
-      "探测出来的协议该写回配置，下次就不必再试",
-    );
-    // 一次是探测建的隧道，一次是设置后的立即查询。
-    assert.deepEqual(
-      chain.connects,
-      [`127.0.0.1:${chain.targetPort}`, `127.0.0.1:${chain.targetPort}`],
-      "设置后没走代理",
-    );
-    assert.ok(
-      ext.notifications.some((item) => item.message.includes("连接正常")),
-      `没报连接正常：${ext.notifications.map((item) => item.message).join(" / ")}`,
-    );
-    // 状态栏只报开关，不回显地址。
-    const withProxy = ext.statuses.get(STATUS_KEY) ?? "";
-    assert.ok(withProxy.includes("代理 开"), `状态栏没显示代理已开：${withProxy}`);
-    assert.doesNotMatch(withProxy, new RegExp(String(chain.proxyPort)), "状态栏不该出现代理端口");
-
-    await ext.run("v2ex", "proxy off");
-    assert.equal(loadConfig(ext.dir).proxy, "");
-    assert.equal(chain.connects.length, 2, "关掉代理后不该再走代理");
-    assert.match(
-      ext.statuses.get(STATUS_KEY) ?? "",
-      /代理 关/,
-      "关掉代理后状态栏该回到「关」",
-    );
-  } finally {
-    await chain.close();
-  }
-});
-
-test("/v2ex proxy 拒绝认不出的地址与连不通的地址，且不动已有配置", async () => {
-  const ext = await startExtension({ proxy: "http://127.0.0.1:1" });
-
-  // 认不出的协议：当场告知，不静默直连也不静默存下。
-  await ext.run("v2ex", "proxy https://127.0.0.1:8443");
-  assert.equal(loadConfig(ext.dir).proxy, "http://127.0.0.1:1", "非法值不该覆盖已有配置");
-  assert.ok(
-    ext.notifications.some((item) => item.message.includes("无法识别")),
-    `没提示地址非法：${ext.notifications.map((item) => item.message).join(" / ")}`,
-  );
-
-  // 地址格式没问题但三种协议都连不通：同样算设置失败。
-  await ext.run("v2ex", "proxy 127.0.0.1:1");
-  assert.equal(loadConfig(ext.dir).proxy, "http://127.0.0.1:1", "连不通的地址不该写进配置");
-  assert.ok(
-    ext.notifications.some((item) => item.message.includes("设置失败")),
-    `没提示设置失败：${ext.notifications.map((item) => item.message).join(" / ")}`,
-  );
-
-  // 不带参数就是把当前值报出来。
-  await ext.run("v2ex", "proxy");
-  assert.ok(
-    ext.notifications.some((item) => item.message.includes("查询代理：http://127.0.0.1:1")),
-    `没报出当前代理：${ext.notifications.map((item) => item.message).join(" / ")}`,
-  );
-});
-
-test("详情面板列出当前的查询代理", async () => {
-  const ext = await startExtension({ proxy: "http://127.0.0.1:1" });
-  await ext.run("v2ex", "");
-
-  const lines = ext.widgets.get("v2ex-quota-details") ?? [];
-  assert.ok(
-    lines.some((line) => line.includes("查询代理：http://127.0.0.1:1")),
-    `详情里没有代理那行：${lines.join(" / ")}`,
-  );
-});
-
-test("调试日志记下本次会话读到的代理设置", async () => {
-  const ext = await startExtension({ proxy: "http://127.0.0.1:1", debug: true });
-  await ext.emit("session_start", { type: "session_start", reason: "startup" });
-  await sleep(80);
-
-  const log = readFileSync(join(ext.dir, "v2ex-quota.log"), "utf8");
-  assert.match(log, /proxy=http:\/\/127\.0\.0\.1:1/);
-});
-
-test("没配代理时日志里标成 none", async () => {
-  const ext = await startExtension({ debug: true });
-  await ext.emit("session_start", { type: "session_start", reason: "startup" });
-  await sleep(80);
-
-  const log = readFileSync(join(ext.dir, "v2ex-quota.log"), "utf8");
-  assert.match(log, /proxy=none/);
 });

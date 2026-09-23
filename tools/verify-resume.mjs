@@ -10,17 +10,18 @@
  *   node tools/verify-resume.mjs --case start # 已知额度用尽，/v2ex start 能不能直接排上
  *   node tools/verify-resume.mjs --case start-live # /v2ex start 排上后，倒计时与到点续跑能不能真的接上
  *   node tools/verify-resume.mjs --case retry # 上游 522 之后能不能按退避自动重试
- *   node tools/verify-resume.mjs --case proxy # 只写主机端口能不能自动认出代理协议
  *
- * 六条路径都靠 `PI_CODING_AGENT_DIR` 把 agent 目录挪到临时目录，
+ * 五条路径都靠 `PI_CODING_AGENT_DIR` 把 agent 目录挪到临时目录，
  * 绝不碰你真实的配置与等待计划；跑完自动清理。
  *
- * 其中 start / rearm / proxy 打的是真实的配额接口（proxy 还要连真实代理）。
- * 本机直连不到 edge.v2ex.com 时，给它们配一个本地代理即可
- * （用假服务的另外三条不读这个变量）：
+ * 其中 start / rearm 打的是真实的配额接口。本机直连不到 edge.v2ex.com 时，
+ * 用 `V2EX_VERIFY_PROXY` 指一个本地代理即可（打 127.0.0.1 假服务的另外三条
+ * 不读这个变量）：
  *   V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:start
- *   V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:proxy
- * rearm 还得给 pi 自己再设一次 HTTPS_PROXY（它要发真消息去撞配额墙）。
+ *   V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:rearm
+ * 它是给 pi 子进程设 HTTP_PROXY / HTTPS_PROXY 的：pi 启动时把
+ * `globalThis.fetch` 换成读这两个变量的 undici 版，扩展的配额查询用的就是
+ * 同一个 fetch，于是配额与对话两条都走代理，不必再给扩展单独配一处。
  */
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -38,9 +39,11 @@ const RESUME_BUFFER_SECONDS = 20;
  *
  * 只有这两条需要它：另外三条打的是 127.0.0.1 上的假服务，绕代理反而可能被
  * 代理自己的 bypass 规则拦住，凭空多一个失败点。
+ *
+ * 它设的是 pi 子进程的环境变量，不是扩展配置 —— 扩展已经不自己管代理了，
+ * 配额查询用的就是 pi 换过的那份全局 fetch。
  */
 const VERIFY_PROXY = (process.env["V2EX_VERIFY_PROXY"] ?? "").trim();
-const proxyConfig = () => (VERIFY_PROXY ? { proxy: VERIFY_PROXY } : {});
 
 const argIndex = process.argv.indexOf("--case");
 const CASE = argIndex >= 0 && process.argv[argIndex + 1] ? process.argv[argIndex + 1] : "resume";
@@ -100,7 +103,16 @@ function prepareAgentDir(agentDir, baseUrl, extraConfig = {}) {
   });
 }
 
-function spawnPi(agentDir) {
+function spawnPi(agentDir, options = {}) {
+  const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
+  // 真实配额接口本机直连不通时，给 pi 自己挂上代理：pi 启动时会把
+  // `globalThis.fetch` 换成读 HTTP_PROXY / HTTPS_PROXY 的 undici 版，
+  // 扩展的配额查询用同一个 fetch，于是配额与对话两条都走代理。
+  // 打 127.0.0.1 假服务的 case 不传这个开关，免得代理的 bypass 规则插一脚。
+  if (options.proxy && VERIFY_PROXY) {
+    env.HTTP_PROXY = VERIFY_PROXY;
+    env.HTTPS_PROXY = VERIFY_PROXY;
+  }
   return spawn(
     process.execPath,
     [
@@ -118,7 +130,7 @@ function spawnPi(agentDir) {
     ],
     {
       cwd: REPO_ROOT,
-      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
@@ -273,8 +285,8 @@ async function caseResume(agentDir) {
  * 既不丢失，也不退化成 5 分钟的兜底重试。
  */
 async function caseRearm(agentDir) {
-  prepareAgentDir(agentDir, undefined, proxyConfig());
-  if (VERIFY_PROXY) console.log(`${stamp()} 配额接口走代理: ${VERIFY_PROXY}`);
+  prepareAgentDir(agentDir);
+  if (VERIFY_PROXY) console.log(`${stamp()} pi 出网走代理: ${VERIFY_PROXY}`);
 
   const initialResumeAt = Date.now() + 40 * 60 * 1000;
   writeFileSync(
@@ -283,7 +295,7 @@ async function caseRearm(agentDir) {
   );
   console.log(`${stamp()} 预置等待计划: ${new Date(initialResumeAt).toISOString()}（40 分钟后）`);
 
-  const child = spawnPi(agentDir);
+  const child = spawnPi(agentDir, { proxy: true });
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", () => {});
   child.stderr.setEncoding("utf8");
@@ -392,11 +404,11 @@ async function caseRearm(agentDir) {
 const stripAnsi = (text) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 async function caseStart(agentDir) {
-  prepareAgentDir(agentDir, undefined, proxyConfig());
-  if (VERIFY_PROXY) console.log(`${stamp()} 配额接口走代理: ${VERIFY_PROXY}`);
+  prepareAgentDir(agentDir);
+  if (VERIFY_PROXY) console.log(`${stamp()} pi 出网走代理: ${VERIFY_PROXY}`);
   const customPrompt = "验证用提示词：接着把状态栏对齐修掉";
 
-  const child = spawnPi(agentDir);
+  const child = spawnPi(agentDir, { proxy: true });
   const ui = [];
   let sawAgentStart = false;
   let buf = "";
@@ -504,139 +516,6 @@ async function caseStart(agentDir) {
       `与窗口重置一致=${matchesWindow} 提示词随计划落盘=${keepsPrompt}` +
         ` 状态栏进入等待=${waited} 有排期提示=${saidArmed} 未产生 agent 轮次=${noAgentTurn}`,
       `\n${pass ? "通过" : "失败"}：/v2ex start 在零 agent 轮次下完成了排期`,
-    ].join("\n"),
-  );
-}
-
-// ------------------------------------------------------------------ case: proxy
-
-/**
- * 场景：本机得走代理才出网，但用户只写「主机:端口」，协议交给扩展自己试。
- * 期望：探测出真能用的那种协议并写回配置、设置完立刻查询成功、状态栏把代理记为「开」，
- * 关闭后回到直连且状态栏记为「关」。
- *
- * 需要 `V2EX_VERIFY_PROXY` 指向本机一个真实可用的代理，且地址里的协议会被故意剥掉 ——
- * 走的就是用户实际会走的那条路（不告诉扩展对面是什么协议）。
- */
-async function caseProxy(agentDir) {
-  if (!VERIFY_PROXY) {
-    console.log("失败：这条 case 需要一个真实可用的本地代理才能验");
-    console.log("      V2EX_VERIFY_PROXY=http://127.0.0.1:37777 npm run verify:proxy");
-    return 2;
-  }
-  const bare = VERIFY_PROXY.replace(/^[a-z][a-z\d+.-]*:\/\//i, "");
-  prepareAgentDir(agentDir, undefined, {});
-  console.log(`${stamp()} 只写主机端口来设置代理: ${bare}`);
-
-  const child = spawnPi(agentDir);
-  const ui = [];
-  let buf = "";
-
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (d) => process.stdout.write(`${stamp()} [stderr] ${d}`));
-  child.stdout.on("data", (chunk) => {
-    buf += chunk;
-    let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx).replace(/\r$/, "");
-      buf = buf.slice(idx + 1);
-      let ev;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (ev.method === "setStatus") {
-        ui.push({ method: "setStatus", text: stripAnsi(ev.statusText ?? "") });
-        console.log(
-          `${stamp()} setStatus ${ev.statusKey} = ${JSON.stringify(stripAnsi(ev.statusText ?? ""))}`,
-        );
-      } else if (ev.method === "notify") {
-        ui.push({ method: "notify", message: ev.message, kind: ev.notifyType });
-        console.log(`${stamp()} notify[${ev.notifyType ?? "info"}] ${ev.message}`);
-      }
-    }
-  });
-
-  const finish = (code, lines) => {
-    child.kill();
-    console.log(`\n${stamp()} --- 扩展调试日志 ---`);
-    process.stdout.write(readLog(agentDir));
-    console.log(`\n${lines}`);
-    return code;
-  };
-
-  // 阶段一：先让启动那次直连查询跑完（本机大概会超时），确认扩展就绪且此刻是直连。
-  const first = await waitForLog(
-    agentDir,
-    (text) =>
-      text.includes("quota: active=") || (text.includes("quota fetch failed") ? "failed" : undefined),
-    40_000,
-  );
-  if (!first) return finish(1, "失败：启动查询一直没有结论");
-  console.log(`${stamp()} 启动时的直连查询：${first.hit === "failed" ? "失败（预期）" : "成功"}`);
-  const directFailed = first.hit === "failed";
-  const before = readConfigFile(agentDir).proxy ?? "";
-  const statusBefore = ui.filter((e) => e.method === "setStatus").map((e) => e.text).at(-1) ?? "";
-
-  // 阶段二：只给主机端口，协议由扩展探测。
-  child.stdin.write(`${JSON.stringify({ type: "prompt", message: `/v2ex proxy ${bare}` })}\n`);
-  // 要等到「设置之后这次查询」有结论为止，不能只等 proxy set —— 那只是探测完成，
-  // 真正取配额是紧接着的第二次请求，先于它断言会读到一个还没更新的状态栏。
-  await waitForLog(
-    agentDir,
-    (text) => {
-      const marker = text.indexOf("proxy set:");
-      if (marker < 0) return undefined;
-      const after = text.slice(marker);
-      if (after.includes("quota: active=")) return "query-ok";
-      return after.includes("quota fetch failed") ? "query-failed" : undefined;
-    },
-    60_000,
-  );
-  await sleep(400);
-
-  const log = readLog(agentDir);
-  const saved = readConfigFile(agentDir).proxy ?? "";
-  const resolved = /^(http|socks5|socks4a):\/\//.exec(saved)?.[1];
-  // 此刻还没有关闭阶段的事件，所以直接扫 ui 就是「设置阶段」的通知。
-  const saidOk = ui.some((e) => e.method === "notify" && e.message.includes("配额查询已走"));
-  const statusWithProxy = ui.filter((e) => e.method === "setStatus").map((e) => e.text).at(-1) ?? "";
-  const showsQuota = /^V2EX [█░]+ \d+%/.test(statusWithProxy);
-  const showsProxyOn = statusWithProxy.includes("代理 开");
-
-  console.log(`${stamp()} 配置里存下的代理：${saved || "(空)"}`);
-  console.log(`${stamp()} 状态栏：${statusWithProxy}`);
-
-  // 阶段三：关掉代理要能退回去。
-  child.stdin.write(`${JSON.stringify({ type: "prompt", message: "/v2ex proxy off" })}\n`);
-  await sleep(3_000);
-  const afterOff = readConfigFile(agentDir).proxy ?? "?";
-  const statusAfterOff = ui.filter((e) => e.method === "setStatus").map((e) => e.text).at(-1) ?? "";
-  const showsProxyOff = statusAfterOff.includes("代理 关");
-
-  const pass =
-    directFailed &&
-    before === "" &&
-    Boolean(resolved) &&
-    saidOk &&
-    showsQuota &&
-    showsProxyOn &&
-    afterOff === "" &&
-    showsProxyOff;
-
-  return finish(
-    pass ? 0 : 1,
-    [
-      `直连失败=${directFailed} 设置前配置为空=${before === ""}`,
-      `探测出协议=${resolved ?? "(无)"} 写回配置=${saved || "(空)"}`,
-      `设置后查询成功=${saidOk} 状态栏有配额进度条=${showsQuota} 代理=开=${showsProxyOn}`,
-      `关闭后配置=「${afterOff}」状态栏代理=关=${showsProxyOff}`,
-      `\n${pass ? "通过" : "失败"}：只写主机端口即可自动认协议并接通`,
-      log.includes("proxy probe:")
-        ? `探测日志：${/proxy probe: .*/m.exec(log)?.[0]}`
-        : "（日志里没有 proxy probe 行）",
     ].join("\n"),
   );
 }
@@ -934,12 +813,8 @@ try {
     process.exitCode = await caseStartLive(agentDir);
   } else if (CASE === "retry") {
     process.exitCode = await caseRetry(agentDir);
-  } else if (CASE === "proxy") {
-    process.exitCode = await caseProxy(agentDir);
   } else {
-    console.error(
-      `未知的 case：${CASE}（可用 resume / rearm / start / start-live / retry / proxy）`,
-    );
+    console.error(`未知的 case：${CASE}（可用 resume / rearm / start / start-live / retry）`);
     process.exitCode = 2;
   }
 } finally {

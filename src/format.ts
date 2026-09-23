@@ -55,7 +55,7 @@ export const BAR_EMPTY = "░";
 export const SEGMENT_SEPARATOR = " | ";
 
 /**
- * 状态栏尾部那三个开关的当前状态。
+ * 状态栏尾部那两个开关的当前状态。
  *
  * 都是全局配置、与具体窗口无关，所以不复用配额那套颜色；关着的也要显示，
  * 否则「现在到底开没开」就得靠 `/v2ex` 面板或翻配置来确认。
@@ -65,8 +65,6 @@ export interface StatusToggles {
   autoWait: boolean;
   /** 上游瞬时故障后是否自动重试。 */
   retryOnError: boolean;
-  /** 配额查询是否走代理。只报开关不报地址：那一行挤不下，地址在 `/v2ex` 面板里看。 */
-  proxy: boolean;
 }
 
 export function formatDuration(ms: number): string {
@@ -178,23 +176,19 @@ function buildQuotaSegment(input: StatusInput): StatusView {
   return { text: segments.map((segment) => segment.text).join(""), level, segments };
 }
 
-/** 开关状态段，形如 `续跑 开 · 重试 关 · 代理 开`。没有配置信息时给 undefined。 */
+/** 开关状态段，形如 `续跑 开 · 重试 关`。没有配置信息时给 undefined。 */
 function buildToggleSegment(toggles: StatusToggles | undefined): StatusSegment | undefined {
   if (!toggles) return undefined;
   const onOff = (value: boolean) => (value ? "开" : "关");
   return {
-    text: [
-      `续跑 ${onOff(toggles.autoWait)}`,
-      `重试 ${onOff(toggles.retryOnError)}`,
-      `代理 ${onOff(toggles.proxy)}`,
-    ].join(" · "),
+    text: [`续跑 ${onOff(toggles.autoWait)}`, `重试 ${onOff(toggles.retryOnError)}`].join(" · "),
     // 配置是静态信息，比实时额度暗一档，眼神先落在配额上。
     tone: "dim",
   };
 }
 
 /**
- * 状态栏单行文案：前半是配额，后半是三项开关的当前状态。
+ * 状态栏单行文案：前半是配额，后半是两项开关的当前状态。
  *
  * 颜色只看配额那一段 —— 开关是静态配置，开着还是关着不该让状态栏变色。
  */
@@ -214,18 +208,12 @@ export function buildStatus(input: StatusInput): StatusView {
 export interface DetailsInput extends StatusInput {
   autoWaitLabel: string;
   retryOnErrorLabel: string;
-  /** 代理的展示文案，已由调用方格式化（未设置时给「未设置（直连）」）。 */
-  proxyLabel: string;
 }
 
 /** `/v2ex` 面板的多行详情。 */
 export function buildDetails(input: DetailsInput): string[] {
-  const { window, now, waiting, waitReason, autoWaitLabel, retryOnErrorLabel, proxyLabel } = input;
-  const toggles = [
-    `自动续跑：${autoWaitLabel}`,
-    `上游重试：${retryOnErrorLabel}`,
-    `查询代理：${proxyLabel}`,
-  ];
+  const { window, now, waiting, waitReason, autoWaitLabel, retryOnErrorLabel } = input;
+  const toggles = [`自动续跑：${autoWaitLabel}`, `上游重试：${retryOnErrorLabel}`];
   const lines = [`${LABEL} AI Chat 配额`];
   if (!window) {
     lines.push("尚未取到配额数据，/v2ex refresh 重试", ...toggles);
