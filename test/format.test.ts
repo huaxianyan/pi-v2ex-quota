@@ -219,6 +219,60 @@ test("等待时刻以排期为准，不再是窗口重置时间", () => {
   assert.equal(view.text, "V2EX 等待 1h");
 });
 
+test("最后一分钟按秒倒计时，不再粗到分钟", () => {
+  const exhausted = (): QuotaWindow =>
+    windowOf({ usedPercent: 100, usedTokens: 1_000, remainingTokens: 0 });
+  const quotaWait = (leadMs: number): string =>
+    buildStatus({ window: exhausted(), now: NOW, waiting: true, waitReason: "quota", resumeAt: NOW + leadMs })
+      .text;
+
+  assert.equal(quotaWait(59_000), "V2EX 等待 59s", "最后一分钟里按秒报");
+  assert.equal(quotaWait(30_000), "V2EX 等待 30s");
+  assert.equal(quotaWait(60_500), "V2EX 等待 1m", "一分钟以上仍按分钟报，不必逐秒抖");
+});
+
+test("倒计时归零后改说即将开始", () => {
+  const exhausted = windowOf({ usedPercent: 100, usedTokens: 1_000, remainingTokens: 0 });
+  const due = (leadMs: number): string =>
+    buildStatus({
+      window: exhausted,
+      now: NOW,
+      waiting: true,
+      waitReason: "quota",
+      resumeAt: NOW + leadMs,
+    }).text;
+
+  // 归零与「不足一秒」都算到点：显示粒度是秒，`0.4s` 与 `0s` 在状态栏上长得一样。
+  assert.equal(due(0), "V2EX 即将开始");
+  assert.equal(due(999), "V2EX 即将开始");
+  assert.equal(due(-30_000), "V2EX 即将开始", "略过点也不该显示负数的秒数");
+  assert.equal(due(1_000), "V2EX 等待 1s");
+});
+
+test("上游故障重试的倒计时归零后改说即将重试", () => {
+  const retry = (leadMs: number): string =>
+    buildStatus({
+      window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
+      now: NOW,
+      waiting: true,
+      waitReason: "error",
+      resumeAt: NOW + leadMs,
+    }).text;
+
+  assert.equal(retry(0), "V2EX 即将重试");
+  assert.equal(retry(30_000), "V2EX 重试 30s");
+  // 取不到任何到点时刻（窗口连重置时间都没有）时才退回兜底词，不凭空说「即将」。
+  assert.equal(
+    buildStatus({
+      window: windowOf({ usedPercent: 50, remainingTokens: 500, periodEnd: 0 }),
+      now: NOW,
+      waiting: true,
+      waitReason: "error",
+    }).text,
+    "V2EX 重试 中",
+  );
+});
+
 test("详情面板会说明上游故障重试的到点时间", () => {
   const lines = buildDetails({
     window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
@@ -235,6 +289,40 @@ test("详情面板会说明上游故障重试的到点时间", () => {
   assert.match(text, /上游重试：已开启（45s 后重试）/);
   // 额度还有量，就不该出现「配额已用尽」这类误导。
   assert.doesNotMatch(text, /配额已用尽/);
+});
+
+test("详情面板在倒计时归零时改说即将", () => {
+  const soon = (overrides: {
+    waitReason: "quota" | "error";
+    resumeAt: number;
+    window: QuotaWindow;
+  }): string =>
+    buildDetails({
+      now: NOW,
+      waiting: true,
+      autoWaitLabel: "已开启（即将继续）",
+      retryOnErrorLabel: "已开启（即将重试）",
+      proxyLabel: "未设置（直连）",
+      ...overrides,
+    }).join("\n");
+
+  const quota = soon({
+    waitReason: "quota",
+    resumeAt: NOW,
+    window: windowOf({ usedPercent: 100, usedTokens: 1_000, remainingTokens: 0 }),
+  });
+  assert.match(quota, /配额已用尽，即将自动续跑/);
+  assert.match(quota, /自动续跑：已开启（即将继续）/);
+  // 归零之后不该再出现 `0s` 这种读数。
+  assert.doesNotMatch(quota, /\b0s\b/);
+
+  const error = soon({
+    waitReason: "error",
+    resumeAt: NOW - 5_000,
+    window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
+  });
+  assert.match(error, /上游故障，即将自动重试/);
+  assert.match(error, /上游重试：已开启（即将重试）/);
 });
 
 test("状态栏尾部接上三个开关的当前状态", () => {

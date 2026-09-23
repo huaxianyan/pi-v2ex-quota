@@ -8,7 +8,7 @@
  *   node tools/verify-resume.mjs              # 默认：到点后能不能真的把一轮对话拉起来
  *   node tools/verify-resume.mjs --case rearm # 用户接管本轮后，等待会不会重新排期
  *   node tools/verify-resume.mjs --case start # 已知额度用尽，/v2ex start 能不能直接排上
- *   node tools/verify-resume.mjs --case start-live # /v2ex start 排上后到点能不能真的接上
+ *   node tools/verify-resume.mjs --case start-live # /v2ex start 排上后，倒计时与到点续跑能不能真的接上
  *   node tools/verify-resume.mjs --case retry # 上游 522 之后能不能按退避自动重试
  *   node tools/verify-resume.mjs --case proxy # 只写主机端口能不能自动认出代理协议
  *
@@ -649,7 +649,10 @@ async function caseProxy(agentDir) {
  * 这是 start 与 resume 的合体 —— 入口是命令，出口是新的 agent 轮次。
  * 两条分开验过不等于链路成立，所以专门跑一次。用假配额服务把「窗口重置」
  * 压到 8 秒后（真窗口要等几十分钟到几小时），一分钟内跑完整条链：
- * 命令排期 → 到点复核 → 注入续跑 → agent 起一轮。
+ * 命令排期 → 状态栏逐秒倒计时 → 到点复核 → 注入续跑 → agent 起一轮。
+ *
+ * 8 秒的等待整段都在最后一分钟里，顺带就把倒计时的刷新与归零文案一起验了：
+ * 轮询间隔是 60 秒，这段时间里状态栏上的秒数只可能由倒计时自己写出来。
  */
 async function caseStartLive(agentDir) {
   const state = { remaining: 0, periodEnd: Math.floor(Date.now() / 1000) + 8 };
@@ -664,6 +667,7 @@ async function caseStartLive(agentDir) {
   const child = spawnPi(agentDir);
   let sawAgentStart = false;
   let resumedText;
+  const statuses = [];
   let buf = "";
 
   child.stdout.setEncoding("utf8");
@@ -681,7 +685,11 @@ async function caseStartLive(agentDir) {
       } catch {
         continue;
       }
-      if (ev.type === "agent_start") {
+      if (ev.method === "setStatus") {
+        const text = stripAnsi(ev.statusText ?? "");
+        statuses.push(text);
+        console.log(`${stamp()} setStatus = ${JSON.stringify(text)}`);
+      } else if (ev.type === "agent_start") {
         sawAgentStart = true;
         console.log(`${stamp()} agent_start`);
       } else if (ev.type === "message_end" && ev.message?.role === "user") {
@@ -729,13 +737,24 @@ async function caseStartLive(agentDir) {
   const resumed = await waitForLog(agentDir, (text) => text.includes("resume: injecting"), 20_000);
   await sleep(1_500);
 
-  const pass = armedOk && resumed !== undefined && sawAgentStart && resumedText !== undefined;
+  // 倒计时：至少两个不同的秒数才算真的在走；归零那一刻该说「即将开始」。
+  const countdowns = statuses
+    .map((text) => /^V2EX 等待 (\d+)s \|/.exec(text)?.[1])
+    .filter((value) => value !== undefined);
+  const ticks = new Set(countdowns).size;
+  const ticking = ticks >= 2;
+  const soon = statuses.some((text) => text.startsWith("V2EX 即将开始"));
+
+  const pass =
+    armedOk && resumed !== undefined && sawAgentStart && resumedText !== undefined && ticking && soon;
   return finish(
     pass ? 0 : 1,
     [
       `排期与窗口重置一致=${armedOk} 到点复核后注入=${resumed !== undefined}` +
         ` agent 起了一轮=${sawAgentStart} 注入内容=自定义提示词=${resumedText !== undefined}`,
-      `\n${pass ? "通过" : "失败"}：/v2ex start 排的等待到点真的把对话接上了`,
+      `倒计时走过的秒数=${countdowns.join("/") || "(无)"}（${ticks} 个不同值，在走=${ticking}）` +
+        ` 归零后说「即将开始」=${soon}`,
+      `\n${pass ? "通过" : "失败"}：/v2ex start 排的等待到点真的把对话接上了，倒计时也逐秒在走`,
     ].join("\n"),
   );
 }

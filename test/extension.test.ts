@@ -25,6 +25,8 @@ interface Harness {
   dir: string;
   ctx: ReturnType<typeof makeCtx>["ctx"];
   statuses: Map<string, string>;
+  /** 状态栏写过的每一版文案，用来断言「刷了多少次」这类随时间发生的事。 */
+  statusLog: string[];
   widgets: Map<string, string[]>;
   notifications: Array<{ message: string; type: string }>;
   abortCount: () => number;
@@ -37,6 +39,7 @@ interface Harness {
 
 function makeCtx(cwd: string) {
   const statuses = new Map<string, string>();
+  const statusLog: string[] = [];
   const widgets = new Map<string, string[]>();
   const notifications: Array<{ message: string; type: string }> = [];
   let aborts = 0;
@@ -45,8 +48,12 @@ function makeCtx(cwd: string) {
     ui: {
       theme: { fg: (_color: string, text: string) => text },
       setStatus(key: string, text: string | undefined) {
-        if (text === undefined) statuses.delete(key);
-        else statuses.set(key, text);
+        if (text === undefined) {
+          statuses.delete(key);
+          return;
+        }
+        statuses.set(key, text);
+        statusLog.push(text);
       },
       setWidget(key: string, content: string[] | undefined) {
         if (content === undefined) widgets.delete(key);
@@ -65,7 +72,7 @@ function makeCtx(cwd: string) {
     },
   };
 
-  return { ctx, statuses, widgets, notifications, abortCount: () => aborts };
+  return { ctx, statuses, statusLog, widgets, notifications, abortCount: () => aborts };
 }
 
 const factory = (await import("../src/index.ts")).default;
@@ -129,9 +136,13 @@ function stubQuota(
   remaining: () => number,
   resetAtMs: () => number,
   active: () => boolean = () => true,
+  /** 让响应慢下来，用来撑开「已到点但续跑复核还没回来」的那一小段窗口。 */
+  delayMs: () => number = () => 0,
 ): () => void {
   const original = globalThis.fetch;
   globalThis.fetch = (async () => {
+    const wait = delayMs();
+    if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
     const total = 8_000_000;
     const left = remaining();
     return new Response(
@@ -192,6 +203,19 @@ function exhaustedResponse(resetAtMs: number) {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 等某个条件成立，比固定 sleep 更贴题：断言的是「那一刻真的到了」，
+ * 而不是「我猜它这时候该到了」。
+ */
+async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<boolean> {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    if (check()) return true;
+    await sleep(25);
+  }
+  return check();
+}
 
 test("扩展注册命令并订阅配额相关事件", async () => {
   const ext = await startExtension({});
@@ -306,13 +330,113 @@ test("开启自动续跑后，窗口刷新即注入续跑消息", async () => {
 
     remaining = 8_000_000;
     await ext.emit("agent_settled", { type: "agent_settled" });
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 /);
+    // 假接口把窗口重置设在 60 秒前，排期时刻已经是过去时，所以状态栏说的是「即将开始」。
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 即将开始 \| /);
 
     await sleep(1_500);
     assert.equal(ext.sent.length, 1, "没有注入续跑消息");
     assert.equal(ext.sent[0], "配额已刷新，继续完成任务。");
     assert.ok(ext.notifications.some((item) => item.message.includes("已刷新")));
     assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████████ 100% · /);
+  } finally {
+    restore();
+  }
+});
+
+test("最后一分钟里逐秒走，归零后改说即将开始", async () => {
+  let delayMs = 0;
+  const restore = stubQuota(
+    () => 0,
+    () => Date.now() + 12_000,
+    () => true,
+    () => delayMs,
+  );
+  try {
+    const ext = await startExtension({ autoWait: true, resumeBufferSeconds: 0 });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(80);
+    await ext.emit("after_provider_response", exhaustedResponse(Date.now() + 12_000));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+
+    // 只剩十几秒，状态栏该已经按秒走。会话的轮询间隔是 3600 秒，所以后面每一个
+    // 新的秒数都只可能来自倒计时自己的定时器。
+    const secondsSeen = (): Set<string> =>
+      new Set(
+        ext.statusLog
+          .map((text) => /^V2EX 等待 (\d+)s \|/.exec(text)?.[1])
+          .filter((value) => value !== undefined),
+      );
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 \d{1,2}s \| /);
+    assert.ok(
+      await waitFor(() => secondsSeen().size >= 2, 12_000),
+      `倒计时没有逐秒走，只见到 ${[...secondsSeen()].join("/") || "(无)"}`,
+    );
+
+    // 到点后的额度复核故意放慢，好让「即将开始」有一段稳定的可观测窗口。
+    delayMs = 3_000;
+    assert.ok(
+      await waitFor(() => (ext.statuses.get(STATUS_KEY) ?? "").startsWith("V2EX 即将开始"), 15_000),
+      `归零后没有换成即将开始：${ext.statuses.get(STATUS_KEY)}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("到点那个瞬间就说即将开始，不等复核回来", async () => {
+  // 排期之后让复核一直挂着不返回，模拟「已经到点、正在复核」的那一段；状态栏不该停在 0s。
+  let armed = false;
+  const restore = stubQuota(
+    () => 0,
+    () => Date.now() + 3_000,
+    () => true,
+    () => (armed ? 3_000 : 0),
+  );
+  try {
+    const ext = await startExtension({ autoWait: true, resumeBufferSeconds: 0 });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(80);
+    await ext.emit("after_provider_response", exhaustedResponse(Date.now() + 3_000));
+    await ext.emit("agent_settled", { type: "agent_settled" });
+    armed = true;
+
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX (等待 \ds|即将开始) \| /);
+    assert.ok(
+      await waitFor(() => (ext.statuses.get(STATUS_KEY) ?? "").startsWith("V2EX 即将开始"), 12_000),
+      `到点后没有说即将开始：${ext.statuses.get(STATUS_KEY)}`,
+    );
+    // 倒计时文案里不该再出现 0s。
+    assert.doesNotMatch(ext.statuses.get(STATUS_KEY) ?? "", /等待 0s/);
+  } finally {
+    restore();
+  }
+});
+
+test("等待排在一分钟以外时不逐秒刷新", async () => {
+  // 固定基准时刻：假接口每次应答都报同一个窗口重置时间，余量才确定。
+  const base = Date.now();
+  const restore = stubQuota(
+    () => 0,
+    () => base + 180_000,
+  );
+  try {
+    const ext = await startExtension({ autoWait: true, resumeBufferSeconds: 0 });
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await sleep(80);
+    await ext.run("v2ex", "start");
+
+    const waitingWrites = (): string[] =>
+      ext.statusLog.filter((text) => text.startsWith("V2EX 等待 "));
+    assert.equal(waitingWrites().length, 1, "排期那一刻该写一次等待状态");
+    assert.match(waitingWrites()[0] ?? "", /^V2EX 等待 \d+m \| /, "还差几分钟时按分钟报");
+
+    // 到点前三分钟，逐秒刷屏没有意义：这几秒里除了排期那次，不该再有写入。
+    await sleep(3_000);
+    assert.equal(
+      waitingWrites().length,
+      1,
+      `离到点还早却刷新了：${waitingWrites().join(" / ")}`,
+    );
   } finally {
     restore();
   }
@@ -371,7 +495,9 @@ test("用户自己发消息会取消等待中的自动续跑", async () => {
 
 test("/v2ex start 在配额已用尽时立即排入等待", async () => {
   let remaining = 0;
-  const restore = stubQuota(() => remaining, () => Date.now() + 1_200);
+  // 留 2.5 秒：既落在最后一分钟里（状态栏该按秒报），又不会近到被判成「即将开始」，
+  // 免得这条验排期的用例挂在倒计时文案的边界上。
+  const restore = stubQuota(() => remaining, () => Date.now() + 2_500);
   try {
     const ext = await startExtension({ autoWait: true, resumeBufferSeconds: 0 });
     await ext.emit("session_start", { type: "session_start", reason: "startup" });
@@ -379,7 +505,7 @@ test("/v2ex start 在配额已用尽时立即排入等待", async () => {
 
     // 关键差异：会话里没有任何 agent 轮次，纯粹靠命令排队。
     await ext.run("v2ex", "start");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 /);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX 等待 2s \| /);
     assert.ok(
       ext.notifications.some((item) => item.message.includes("已排入自动续跑")),
       `未提示排期：${ext.notifications.map((item) => item.message).join(" / ")}`,
@@ -388,7 +514,7 @@ test("/v2ex start 在配额已用尽时立即排入等待", async () => {
     assert.ok(readPlan(ext.dir), "等待计划没有落盘");
 
     remaining = 8_000_000;
-    await sleep(2_200);
+    await sleep(3_200);
     assert.equal(ext.sent.length, 1, `没有注入续跑消息：${JSON.stringify(ext.sent)}`);
     assert.equal(ext.sent[0], "配额已刷新，继续完成任务。");
     assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX ████████ 100% · /);

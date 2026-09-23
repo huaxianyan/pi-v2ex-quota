@@ -27,6 +27,7 @@ import {
 import {
   buildDetails,
   buildStatus,
+  COUNTDOWN_DUE_MS,
   formatDuration,
   formatTimestamp,
   type StatusLevel,
@@ -69,6 +70,17 @@ const MAX_ERROR_RETRY_MS = 15 * 60 * 1000;
 
 /** setTimeout 超过该值会退化成 1ms 触发，长等待分段进行。 */
 const MAX_TIMER_MS = 2_147_000_000;
+
+/**
+ * 剩余不足这么久就进入秒级倒计时。
+ *
+ * 等待可能排在几小时之后，整段都每秒刷一遍状态栏既没必要也吵；只在最后一分钟
+ * 改成每秒一动，好让「等待 43s」真的在走。再往上按分钟滚动就够了。
+ */
+const COUNTDOWN_WINDOW_MS = 60_000;
+
+/** 秒级倒计时的刷新频率。 */
+const COUNTDOWN_TICK_MS = 1_000;
 
 const LEVEL_COLORS: Record<StatusLevel, ThemeColor> = {
   ok: "dim",
@@ -123,6 +135,10 @@ export default function (pi: ExtensionAPI) {
   let projectCwd = "";
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 到「最后一分钟起点」的一次性定时器。 */
+  let countdownArmTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 最后一分钟里的每秒刷新。 */
+  let countdownTickTimer: ReturnType<typeof setInterval> | undefined;
   let lastCtx: ExtensionContext | undefined;
   let uiDisabled = false;
 
@@ -208,16 +224,20 @@ export default function (pi: ExtensionAPI) {
 
   function detailLines(): string[] {
     const waiting = pending !== undefined;
-    const away = (): string => formatDuration((pending?.resumeAt ?? Date.now()) - Date.now());
+    // 归零后不再显示「0s 后」：复核与注入都还要一点时间，说「即将」更贴近实情。
+    const away = (): string => {
+      const left = (pending?.resumeAt ?? Date.now()) - Date.now();
+      return left < COUNTDOWN_DUE_MS ? "即将" : `${formatDuration(left)} 后`;
+    };
 
     let autoWaitLabel = "已关闭";
     if (config.autoWait) {
-      autoWaitLabel = waiting && pending?.reason === "quota" ? `已开启（${away()} 后继续）` : "已开启";
+      autoWaitLabel = waiting && pending?.reason === "quota" ? `已开启（${away()}继续）` : "已开启";
     }
     let retryOnErrorLabel = "已关闭";
     if (config.retryOnError) {
       retryOnErrorLabel =
-        waiting && pending?.reason === "error" ? `已开启（${away()} 后重试）` : "已开启";
+        waiting && pending?.reason === "error" ? `已开启（${away()}重试）` : "已开启";
     }
     return buildDetails({
       window: latest,
@@ -318,6 +338,7 @@ export default function (pi: ExtensionAPI) {
     if (!ctx) return;
     refreshStatus(ctx);
     renderDetails(ctx);
+    syncCountdown(ctx);
   }
 
   function armWait(
@@ -350,6 +371,57 @@ export default function (pi: ExtensionAPI) {
     resumeTimer = timer;
     refreshStatus(ctx);
     renderDetails(ctx);
+    syncCountdown(ctx);
+  }
+
+  function stopCountdown(): void {
+    if (countdownArmTimer) {
+      clearTimeout(countdownArmTimer);
+      countdownArmTimer = undefined;
+    }
+    if (countdownTickTimer) {
+      clearInterval(countdownTickTimer);
+      countdownTickTimer = undefined;
+    }
+  }
+
+  /**
+   * 按等待的远近安排秒级倒计时。
+   *
+   * 这只是本地的展示倒计时，不追求跟服务端对齐 —— 到点之后还要复核额度、
+   * 注入消息，本来就会晚一点，归零到真正续跑之间的那一小段由「即将开始」兜着。
+   * 排在一分钟以外时只挂一个到「最后一分钟起点」的一次性定时器，不逐秒空转。
+   */
+  function syncCountdown(ctx: ExtensionContext): void {
+    stopCountdown();
+    if (!pending || !canUseUi(ctx)) return;
+    const left = pending.resumeAt - Date.now();
+    if (left > COUNTDOWN_WINDOW_MS) {
+      const arm = setTimeout(() => {
+        countdownArmTimer = undefined;
+        syncCountdown(lastCtx ?? ctx);
+      }, Math.min(left - COUNTDOWN_WINDOW_MS, MAX_TIMER_MS));
+      (arm as { unref?: () => void }).unref?.();
+      countdownArmTimer = arm;
+      return;
+    }
+    const tick = (): void => {
+      const live = lastCtx ?? ctx;
+      if (!pending) {
+        // 计划已被收走（续跑注入、用户取消、到点后清掉），自己停掉并补一次干净的状态栏。
+        stopCountdown();
+        refreshStatus(live);
+        renderDetails(live);
+        return;
+      }
+      refreshStatus(live);
+      renderDetails(live);
+    };
+    const ticker = setInterval(tick, COUNTDOWN_TICK_MS);
+    (ticker as { unref?: () => void }).unref?.();
+    countdownTickTimer = ticker;
+    // 立刻走一帧，免得排上之后还要等一秒才显示秒数。
+    tick();
   }
 
   /**
@@ -365,6 +437,8 @@ export default function (pi: ExtensionAPI) {
     notify(ctx, note, "info");
     refreshStatus(ctx);
     renderDetails(ctx);
+    // 计划已经收掉，倒计时也该跟着停。
+    syncCountdown(ctx);
     if (ctx.isIdle()) pi.sendUserMessage(prompt);
     else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
   }
@@ -581,6 +655,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     stopPolling();
+    stopCountdown();
     if (resumeTimer) {
       clearTimeout(resumeTimer);
       resumeTimer = undefined;

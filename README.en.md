@@ -6,7 +6,7 @@ Surfaces your V2EX AI Chat quota in pi's status line, automatically continues th
 
 ## What it does
 
-1. **Status line**: a quota bar, the remaining percentage, a countdown to the window reset, plus the current state of all three toggles.
+1. **Status line**: a quota bar, the remaining percentage, a countdown to the window reset (ticking per second in the final minute, turning into `即将开始` at zero), plus the current state of all three toggles.
 2. **Immediate takeover**: when the quota is exhausted (HTTP 429 with a zero token balance) it aborts the current turn at once, instead of sitting through pi's three backoff retries.
 3. **Auto-resume** (optional toggle): waits until the window resets, re-checks the quota, then injects a message so the agent picks up the unfinished work.
 4. **Upstream retry** (optional toggle, off by default): when a 5xx, timeout or dropped connection kills the turn, waits out a backoff and picks the work up again.
@@ -82,12 +82,17 @@ One line, two segments separated by ` | `: quota first, then the state of the th
 V2EX ███████░ 87% · 4h12m | 续跑 关 · 重试 关 · 代理 开   87% remaining, resets in 4h12m
 V2EX ░░░░░░░░ 0% · 2h41m | 续跑 开 · 重试 关 · 代理 开   Quota exhausted, no wait queued yet
 V2EX 等待 2h41m | 续跑 开 · 重试 关 · 代理 开            Auto-resume queued, continues when the countdown ends
+V2EX 等待 43s | 续跑 开 · 重试 关 · 代理 开              Under a minute left, now ticking per second
+V2EX 即将开始 | 续跑 开 · 重试 关 · 代理 开              Countdown hit zero; re-checking and injecting the resume
 V2EX 重试 45s | 续跑 开 · 重试 开 · 代理 关              Upstream failed, waiting out a backoff (unrelated to quota)
+V2EX 即将重试 | 续跑 开 · 重试 开 · 代理 关              Retry countdown hit zero, next turn starts right away
 V2EX 空闲 | 续跑 关 · 重试 关 · 代理 关                  No active window; the next message opens one
 V2EX -- | 续跑 关 · 重试 关 · 代理 关                    No data fetched yet
 ```
 
 **Quota segment**: both the bar and the percentage mean the **remaining** quota (not the used amount); the trailing time is until the window reset (or until the next retry when retrying). The bar is eight cells — filled is remaining, empty is dimmed one step down. It only fills completely when the quota is genuinely full: rounding would draw 97% as full, which misleads more than the number beside it.
+
+**Countdown**: above one minute it is reported in minutes (riding along with the `pollSeconds` poll); once the last minute starts it ticks every second — at minute granularity the number on screen would just sit there. When less than a second remains (including the moment it is already due but the re-check has not come back), the text becomes `即将开始` (`即将重试` on the retry path) instead of a frozen `0s`. This countdown is computed locally from the scheduled time and is not meant to match the server: after the deadline there is still a quota re-check and a message injection, so it is inherently a little late.
 
 **Toggle segment**: `续跑` (auto-resume) / `重试` (upstream retry) / `代理` (proxy) map to `/v2ex wait`, `/v2ex retry` and `/v2ex proxy`. Off toggles are shown too — the point of the status line is not having to run a command to check. The proxy shows up as a plain on/off; the address lives in the `/v2ex` panel, since there is no room for it here.
 
@@ -113,7 +118,7 @@ A few boundaries:
 - **One success resets the count.** As soon as a request actually goes through, the consecutive-failure count goes back to zero; so does you taking over the turn manually.
 - **The wait plan is persisted too.** Restarting pi resumes it; but if you turned `/v2ex retry off`, restoring the plan at startup is skipped as well.
 
-The status line switches from the quota segment to `V2EX 重试 45s`, and the notification names the failure class (`HTTP 522` / request timeout / connection loss) and which attempt this is.
+The status line switches from the quota segment to `V2EX 重试 45s`, and the notification names the failure class (`HTTP 522` / request timeout / connection loss) and which attempt this is. The last minute ticks per second here too, and at zero it becomes `V2EX 即将重试`.
 
 ## Routing the quota query through a local proxy
 
@@ -170,7 +175,7 @@ If the auto-resume toggle happens to be off when scheduling, it is turned on as 
 
 ### What you will see while waiting
 
-**pi's "working" indicator disappears, and that is normal**: after `ctx.abort()` the turn is already over, nothing is running, and the wait is carried by the extension's own timer, independent of the agent's run state. The evidence that it is still waiting is the status line (`V2EX 等待 <countdown>` in the quota segment, refreshed every 60 seconds) plus the two notifications you get when the wait is queued.
+**pi's "working" indicator disappears, and that is normal**: after `ctx.abort()` the turn is already over, nothing is running, and the wait is carried by the extension's own timer, independent of the agent's run state. The evidence that it is still waiting is the status line (`V2EX 等待 <countdown>` in the quota segment, ticking per second in the final minute, turning into `V2EX 即将开始` at zero) plus the two notifications you get when the wait is queued.
 
 Do not send a message in that session while waiting: any turn you start cancels the wait. Scrolling, paging through history and checking the status are all fine.
 
@@ -227,6 +232,7 @@ The chat apiKey in `models.json` can be used directly as a Personal Access Token
 - **One-shot runs do not take over the wait.** In `pi -p` (print) and json modes it does not write the status line and does not schedule an auto-resume; it only aborts. The reason is that these runs destroy the extension runner when they end, after which any UI call throws a stale-ctx error, and leaving a wait plan behind would pollute the next interactive startup.
 - **`ctx` can go stale.** A captured `ctx` used after an `await` can throw `This extension ctx is stale`. This extension only writes UI in `tui` / `rpc` mode, and stops trying after the first UI error.
 - **The wait timer is unref'd.** Waits run for hours; if the timer were the last handle in the event loop, it would hold up pi's exit — in tests the symptom is `node --test` never finishing. The plan is already on disk and recoverable after a restart, so not blocking process exit is safe.
+- **The per-second countdown does not ride on polling.** `pollSeconds` defaults to 60, so in the last minute a minute-granularity refresh would leave a frozen number on screen. Once a wait is queued, two more timers are armed: a one-shot for the moment the final minute begins (nothing ticks per second while the wait is further out) and a per-second refresher for that final minute. Both are unref'd and both stop by themselves once the plan is gone (resume injected, user cancelled). It is a display-only local countdown, not an attempt to match the server.
 - **Without a quota snapshot it degrades to a 5-minute fallback first.** The reset time used when scheduling on `agent_settled` comes from the most recent quota query; if the session just started and the first poll has not returned, there is no reset time to use, so it schedules 5 minutes out first. On arrival `resumeNow` queries again and, finding itself still inside the same exhausted window, defers to the real reset time — the cost is one wasted check and one `maxResumeAttempts` slot. Long-running sessions never hit this (measured: hitting the wall 1.3 seconds into a session scheduled `+5m`; the same scenario schedules the window reset time once the snapshot has landed).
 
 - **pi has auto-retry of its own, but it only covers the first dozen seconds.** On an upstream error pi re-runs the whole agent turn, backing off 2s → 4s → 8s for three attempts, and only then emits `auto_retry_end` and `agent_settled` (measured on 2026-09-22 from the RPC event stream). So the upstream-retry toggle is an addition behind it, not a replacement: for one 522, the gap between sending the message and the extension scheduling is about 55 seconds.
@@ -256,6 +262,8 @@ npm test
 
 Node 22 ships type stripping and a test runner, so the tests run `.ts` directly — no build, no dependencies to install. They cover protocol parsing and formatting, and drive the whole extension (registration, status display, abort, wait, resume, attempt-limit stop) through a fake pi, fake context and fake quota endpoint.
 
+Watch out for machine load on the countdown cases: running the full suite spawns one process per test file, and an `await sleep(80)` was measured taking 1.6 seconds. So do not assert values that bake in scheduling delay ("the wait is exactly X seconds at the moment it is queued"); assert the shape (`等待 \ds`) with a generous margin instead. "It really ticks per second" is checked by counting how many distinct second values show up in `statusLog` — the session's poll interval is set to 3600 seconds, so those writes can only come from the countdown timer.
+
 The script uses `node --test "test/**/*.test.ts"`. **Do not write `node --test test/`** — Node 22 does not expand a directory into test files; it treats it as a module to `require`, fails with `Cannot find module '<project>\test'`, and disguises that as "1 test failed". The quotes route through Node's own glob, which also keeps it independent of shell expansion.
 
 ### Type checking
@@ -283,13 +291,13 @@ pi -p "hi" --provider v2ex --model coder --no-session --offline \
 
 ### On-device self-checks: resume, re-arm, manual queueing, upstream retry and proxy probing
 
-`npm test` uses a fake pi, so it proves the extension's own logic. But the things that genuinely depend on pi's lifecycle — whether `sendUserMessage` opens a new turn when the **session is idle**, whether the wait is re-armed after the user takes over, whether `/v2ex start` can schedule with zero agent turns, whether the task really continues after an upstream failure, and whether a bare `ip:port` gets its protocol recognised — can only be answered by a real pi. `tools/verify-resume.mjs` covers those layers:
+`npm test` uses a fake pi, so it proves the extension's own logic. But the things that genuinely depend on pi's lifecycle — whether `sendUserMessage` opens a new turn when the **session is idle**, whether the wait is re-armed after the user takes over, whether `/v2ex start` can schedule with zero agent turns, whether the status line ticks per second through the final minute and changes its wording at zero, whether the task really continues after an upstream failure, and whether a bare `ip:port` gets its protocol recognised — can only be answered by a real pi. `tools/verify-resume.mjs` covers those layers:
 
 ```bash
 npm run verify:resume          # does it really start a turn when the time arrives
 npm run verify:rearm           # is the wait re-armed after the user takes over
 npm run verify:start           # can /v2ex start schedule directly (requires quota to be exhausted at the time)
-npm run verify:start-live      # after /v2ex start schedules, does it really connect when the time arrives
+npm run verify:start-live      # after /v2ex start schedules, do the countdown and the resume actually connect
 npm run verify:retry           # does it retry with backoff after an upstream 522
 npm run verify:proxy           # is a bare host:port's protocol recognised (needs a working local proxy)
 ```
@@ -365,15 +373,22 @@ The scheduled time is exactly `reset + resumeBufferSeconds`; the custom prompt i
 通过：配额仍有余量，start 未排等待并说明了原因（提示=true 无计划=true 无 agent 轮次=true）
 ```
 
-`start-live` is `start` and `resume` combined — the entry is a command, the exit is a new agent turn. **Verifying the two separately does not prove the chain holds**, so there is a dedicated run: a fake quota service compresses the "window reset" to 8 seconds out (a real window is tens of minutes to hours away), and the whole thing completes within a minute. Measured output (2026-09-22):
+`start-live` is `start` and `resume` combined — the entry is a command, the exit is a new agent turn. **Verifying the two separately does not prove the chain holds**, so there is a dedicated run: a fake quota service compresses the "window reset" to 8 seconds out (a real window is tens of minutes to hours away), and the whole thing completes within a minute. An 8-second wait sits entirely inside the final minute, so the countdown gets verified along the way (the session polls every 60 seconds, so every second shown here can only have come from the countdown itself). Measured output (2026-09-23):
 
 ```
-+    30ms 假配额：余额 0、窗口 10:18:01Z 重置（8 秒后）
-+  1683ms 已排期：2026-09-22T10:18:01.000Z（窗口重置 2026-09-22T10:18:01.000Z）
-+  6699ms 额度已恢复（假的），等它到点续跑
-+  7237ms agent_start
-+  7238ms 会话内出现用户消息: "开始改状态栏对齐"
-排期与窗口重置一致=true 到点复核后注入=true agent 起了一轮=true 注入内容=自定义提示词=true → 通过
++    38ms 假配额：余额 0、窗口 10:21:23Z 重置（8 秒后）
++  1780ms setStatus = "V2EX 等待 5s | 续跑 开 · 重试 关 · 代理 关"
++  1984ms 已排期：2026-09-23T10:21:23.000Z（窗口重置 2026-09-23T10:21:23.000Z）
++  2792ms setStatus = "V2EX 等待 4s | 续跑 开 · 重试 关 · 代理 关"
++  3806ms setStatus = "V2EX 等待 3s | 续跑 开 · 重试 关 · 代理 关"
++  4806ms setStatus = "V2EX 等待 2s | 续跑 开 · 重试 关 · 代理 关"
++  5815ms setStatus = "V2EX 等待 1s | 续跑 开 · 重试 关 · 代理 关"
++  6829ms setStatus = "V2EX 即将开始 | 续跑 开 · 重试 关 · 代理 关"
++  7161ms agent_start
++  7162ms 会话内出现用户消息: "开始改状态栏对齐"
+排期与窗口重置一致=true 到点复核后注入=true agent 起了一轮=true 注入内容=自定义提示词=true
+倒计时走过的秒数=5/5/4/3/2/1（5 个不同值，在走=true） 归零后说「即将开始」=true
+→ 通过
 ```
 
 `retry` starts a fake upstream whose quota endpoint is healthy while completions always return 522, acting the upstream failure out. pi insists on three retries of its own before handing over, so this case takes over a minute. Measured output (2026-09-22):

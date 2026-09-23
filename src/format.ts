@@ -33,6 +33,14 @@ export const LABEL = "V2EX";
 /** 剩余比例低于该值时状态转为告警色。 */
 export const LOW_REMAINING_PERCENT = 15;
 
+/**
+ * 倒计时算作「已到点」的余量：不足一秒就当已经归零。
+ *
+ * 显示粒度是秒，`0.4s` 与 `0s` 在状态栏上是同一个样子；非等到它真的走到负数
+ * 再换文案，中间会白挂一秒「等待 0s」。
+ */
+export const COUNTDOWN_DUE_MS = 1_000;
+
 /** 进度条格数，与 pi-usage-bars 页脚那条一致：够看出来，又不至于把状态栏撑满。 */
 export const BAR_WIDTH = 8;
 export const BAR_FILLED = "█";
@@ -125,15 +133,19 @@ function plainView(text: string, level: StatusLevel): StatusView {
 function buildQuotaSegment(input: StatusInput): StatusView {
   const { window, now, waiting, waitReason } = input;
   const deadline = input.resumeAt ?? resetDeadlineMs(window);
-  const countdown = deadline === undefined ? "" : formatDuration(deadline - now);
+  const left = deadline === undefined ? undefined : deadline - now;
+  const countdown = left === undefined ? "" : formatDuration(left);
+  const due = left !== undefined && left < COUNTDOWN_DUE_MS;
 
   if (waiting) {
     // 上游故障与额度无关，窗口里还有量也照样在等重试。
     if (waitReason === "error") {
-      return plainView(`${LABEL} 重试 ${countdown || "中"}`, "waiting");
+      // 倒计时归零后改说「即将」：到点与真正续跑之间还隔着一次复核与消息注入，
+      // 盯着一个不动的 `0s` 会以为卡住了。
+      return plainView(due ? `${LABEL} 即将重试` : `${LABEL} 重试 ${countdown || "中"}`, "waiting");
     }
     if (!window || !window.active || isExhausted(window)) {
-      return plainView(`${LABEL} 等待 ${countdown || "刷新"}`, "waiting");
+      return plainView(due ? `${LABEL} 即将开始` : `${LABEL} 等待 ${countdown || "刷新"}`, "waiting");
     }
   }
 
@@ -243,11 +255,20 @@ export function buildDetails(input: DetailsInput): string[] {
     lines.push(
       resumeAt === undefined
         ? "上游故障，正在等待重试"
-        : `上游故障，${formatDuration(resumeAt - now)} 后自动重试`,
+        : resumeAt - now < COUNTDOWN_DUE_MS
+          ? "上游故障，即将自动重试"
+          : `上游故障，${formatDuration(resumeAt - now)} 后自动重试`,
     );
   }
   if (isExhausted(window)) {
-    lines.push(waiting ? "配额已用尽，正在等待刷新后自动续跑" : "配额已用尽");
+    const left = input.resumeAt === undefined ? undefined : input.resumeAt - now;
+    lines.push(
+      !waiting
+        ? "配额已用尽"
+        : left !== undefined && left < COUNTDOWN_DUE_MS
+          ? "配额已用尽，即将自动续跑"
+          : "配额已用尽，正在等待刷新后自动续跑",
+    );
   }
   lines.push(...toggles);
   return lines;
