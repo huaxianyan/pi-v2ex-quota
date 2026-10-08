@@ -340,6 +340,28 @@ test("状态栏尾部接上两个开关的当前状态", () => {
   assert.equal(separator.tone, "dim");
 });
 
+test("临时窗口状态接在开关后面", () => {
+  const view = buildStatus({
+    window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
+    now: NOW,
+    waiting: false,
+    toggles: { autoWait: true, retryOnError: false, compact: "400K" },
+  });
+  assert.equal(view.text, "V2EX ████░░░░ 50% · 2h | 续跑 开 · 重试 关 · 窗口 400K");
+});
+
+test("详情面板列出临时窗口状态", () => {
+  const lines = buildDetails({
+    window: windowOf({ usedPercent: 50, remainingTokens: 500 }),
+    now: NOW,
+    waiting: false,
+    autoWaitLabel: "已开启",
+    retryOnErrorLabel: "已关闭",
+    compactLabel: "400,000 tokens",
+  });
+  assert.match(lines.join("\n"), /临时窗口：400,000 tokens/);
+});
+
 test("开关全关也逐个显示，不省略", () => {
   const view = buildStatus({
     window: windowOf({ usedPercent: 50, remainingTokens: 500 }),

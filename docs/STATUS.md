@@ -12,6 +12,10 @@
 - 读取 pi 的实际预留量与逐模型覆盖，检查 Smart Compact 的安装及全局触发门槛。
 - 压缩失败后暂停临时窗口、恢复原值并停止自动任务，手动压缩后可重新启用。
 
+- 状态栏开关段新增临时窗口：开启时显示目标（`400K`），关闭、待启用、补救失败后暂停各有不同文案。
+- `/v2ex compact status` 改为报出 Smart Compact 自动压缩的实际开关和最低占比，不再让人自己去翻设置面板。
+- 启用、暂停、恢复及压缩失败时会立刻重画状态栏，不等下一次轮询。
+
 ### 验证与边界
 
 - `node tools/verify-compact-window.mjs` 通过：真实 pi 和 Smart Compact 自动生成并应用摘要，模型及 pi 设置文件保持原样。包含关闭恢复、模型切换和重载。
@@ -42,7 +46,7 @@
 
 ### 验证记录
 
-- V2EX 全量 Node 测试 84 项通过。
+- V2EX 全量 Node 测试 89 项通过，含状态栏窗口段与 `compact status` 的开关文案。
 - Smart Compact 定向检查共 8 项通过：接口成功及超时两项，现有工具回归六项。补齐测试 fixture 的事件总线后仅重跑此前失败的一项。
 - 相关源码严格 TypeScript 检查通过，库目标与既有代码对齐为 ES2024。
 - 真实 pi 集成 `SMART_COMPACT_EXTENSION=E:/dev/pi-smart-compact/dist/index.js node tools/verify-compact-window.mjs --recovery` 通过：初次自动压缩失败、保存计划、配额等待、重载恢复、补救摘要应用、任务续跑。

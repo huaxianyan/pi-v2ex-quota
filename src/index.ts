@@ -210,6 +210,7 @@ export default function (pi: ExtensionAPI) {
         toggles: {
           autoWait: config.autoWait,
           retryOnError: config.retryOnError,
+          compact: compactWindow.label(config),
         },
       });
       const paint = (segment: StatusSegment): string =>
@@ -245,6 +246,7 @@ export default function (pi: ExtensionAPI) {
       resumeAt: pending?.resumeAt,
       autoWaitLabel,
       retryOnErrorLabel,
+      compactLabel: compactWindow.detail(config),
     });
   }
 
@@ -503,6 +505,8 @@ export default function (pi: ExtensionAPI) {
   async function stopCompactionRecovery(ctx: ExtensionContext, message: string): Promise<void> {
     clearWait("压缩补救已停止", ctx);
     await compactWindow.pause(ctx);
+    // 窗口被收回，「窗口」那一段要立刻从 `400K` 改成 `暂停`。
+    refreshStatus(ctx);
     notify(ctx, message + "。原会话记录保留，请手动执行 /smart-compact；成功后用 /v2ex compact on 恢复", "warning");
   }
 
@@ -548,7 +552,7 @@ export default function (pi: ExtensionAPI) {
       if (!live()) return;
       if (result.status === "applied") {
         compactWindow.resume();
-        await compactWindow.sync(ctx, config);
+        await syncCompactWindow(ctx);
         if (!live()) return;
         if (ctx.hasPendingMessages()) {
           clearWait("用户已有后续任务", ctx);
@@ -742,6 +746,8 @@ export default function (pi: ExtensionAPI) {
     if (active) {
       endpoint = resolveEndpoint();
       restorePending(ctx);
+      // 模型切换会重建 ctx，状态栏的窗口标签要跟着新模型走。
+      refreshStatus(ctx);
       startPolling(ctx);
       return;
     }
@@ -769,6 +775,8 @@ export default function (pi: ExtensionAPI) {
       await compactWindow.pause(ctx);
       notify(ctx, `临时窗口暂未启用：${errorText(error)}`, "warning");
     }
+    // 窗口状态就在状态栏那一行里，启用、暂停或恢复后立刻重画。
+    refreshStatus(ctx);
   }
 
   pi.on("model_select", async (event, ctx) => {
@@ -820,6 +828,7 @@ export default function (pi: ExtensionAPI) {
     const branchHeadId = ctx.sessionManager.getLeafId();
     if (!sessionId || !branchHeadId || !canUseUi(ctx)) {
       await compactWindow.pause(ctx);
+      refreshStatus(ctx);
       notify(ctx, "当前会话无法保存压缩恢复计划，请手动执行 /smart-compact 后继续任务", "warning");
       return;
     }
@@ -835,6 +844,7 @@ export default function (pi: ExtensionAPI) {
     stopAfterCompactFailure = ctx.signal === undefined;
     ctx.abort();
     notify(ctx, "自动压缩未完成，本轮结束后自动补救，再继续原任务；/v2ex cancel 可取消", "warning");
+    refreshStatus(ctx);
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
@@ -1065,9 +1075,11 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           notify(ctx, compactWindow.status(ctx, config), "info");
+          refreshStatus(ctx);
         } catch (error) {
           await compactWindow.pause(ctx);
           notify(ctx, `临时窗口设置失败：${errorText(error)}`, "warning");
+          refreshStatus(ctx);
         }
         return;
       }

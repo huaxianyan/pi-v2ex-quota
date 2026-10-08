@@ -83,24 +83,28 @@ When `baseUrl` and `apiKey` are unset, they are read from `providers.v2ex` in `~
 One line, two segments separated by ` | `: quota first, then the state of the two toggles.
 
 ```
-V2EX ███████░ 87% · 4h12m | 续跑 关 · 重试 关      87% remaining, resets in 4h12m
-V2EX ░░░░░░░░ 0% · 2h41m | 续跑 开 · 重试 关      Quota exhausted, no wait queued yet
-V2EX 等待 2h41m | 续跑 开 · 重试 关               Auto-resume queued, continues when the countdown ends
-V2EX 等待 43s | 续跑 开 · 重试 关                 Under a minute left, now ticking per second
-V2EX 即将开始 | 续跑 开 · 重试 关                 Countdown hit zero; re-checking and injecting the resume
-V2EX 重试 45s | 续跑 开 · 重试 开                 Upstream failed, waiting out a backoff (unrelated to quota)
-V2EX 即将重试 | 续跑 开 · 重试 开                 Retry countdown hit zero, next turn starts right away
-V2EX 空闲 | 续跑 关 · 重试 关                     No active window; the next message opens one
-V2EX -- | 续跑 关 · 重试 关                       No data fetched yet
+V2EX ███████░ 87% · 4h12m | 续跑 关 · 重试 关 · 窗口 关       87% remaining, resets in 4h12m, temporary window is off
+V2EX ░░░░░░░░ 0% · 2h41m | 续跑 开 · 重试 关 · 窗口 400K     Quota exhausted, no wait queued yet
+V2EX 等待 2h41m | 续跑 开 · 重试 关 · 窗口 400K              Auto-resume queued, continues when the countdown ends
+V2EX 等待 43s | 续跑 开 · 重试 关 · 窗口 400K                Under a minute left, now ticking per second
+V2EX 即将开始 | 续跑 开 · 重试 关 · 窗口 400K               Countdown hit zero; re-checking and injecting the resume
+V2EX 整理前等待 45s | 续跑 开 · 重试 关 · 窗口 400K         Compaction failed, recovery queued
+V2EX 重试 45s | 续跑 开 · 重试 开 · 窗口 暂停               Upstream failed, waiting out a backoff (unrelated to quota)
+V2EX 空闲 | 续跑 关 · 重试 关 · 窗口 关                      No active window; the next message opens one
+V2EX -- | 续跑 关 · 重试 关 · 窗口 关                        No data fetched yet
 ```
 
 **Quota segment**: both the bar and the percentage mean the **remaining** quota (not the used amount); the trailing time is until the window reset (or until the next retry when retrying). The bar is eight cells — filled is remaining, empty is dimmed one step down. It only fills completely when the quota is genuinely full: rounding would draw 97% as full, which misleads more than the number beside it.
 
 **Countdown**: above one minute it is reported in minutes (riding along with the `pollSeconds` poll); once the last minute starts it ticks every second — at minute granularity the number on screen would just sit there. When less than a second remains (including the moment it is already due but the re-check has not come back), the text becomes `即将开始` (`即将重试` on the retry path) instead of a frozen `0s`. This countdown is computed locally from the scheduled time and is not meant to match the server: after the deadline there is still a quota re-check and a message injection, so it is inherently a little late.
 
-**Toggle segment**: `续跑` (auto-resume) and `重试` (upstream retry) map to `/v2ex wait` and `/v2ex retry`. Off toggles are shown too — the point of the status line is not having to run a command to check.
+**Toggle segment**: `续跑` (auto-resume), `重试` (upstream retry), and `窗口` (temporary window) map to `/v2ex wait`, `/v2ex retry`, and `/v2ex compact on|off`. Off entries are shown too — the point of the status line is not having to run a command to check.
 
-Note that the visible status text is in Chinese (`等待` = waiting, `重试` = retrying, `空闲` = idle, `--` = unknown). Colors: dim in the normal case, warning color below 15% remaining, error color when exhausted, accent color while waiting or retrying — the toggles never change the colour. Flipping a toggle refreshes the status line immediately, no need to wait for the next poll.
+`窗口` has three distinct inactive states: `关` means the feature is disabled; `待启用` means the switch is on but synchronization has not run yet (fresh session, or just switched to a V2EX model); `暂停` means compaction recovery failed and the window was withdrawn until you run `/v2ex compact on`. When active it shows the target, e.g. `400K`.
+
+Note that the visible status text is in Chinese (`等待` = waiting, `整理前等待` = waiting to compact, `重试` = retrying, `空闲` = idle, `--` = unknown). Colors: dim in the normal case, warning color below 15% remaining, error color when exhausted, accent color while waiting or retrying — the configuration segment never changes the colour. Flipping a setting refreshes the status line immediately, no need to wait for the next poll.
+
+Opening the panel (`/v2ex`) lists the same three settings as full sentences. `/v2ex compact status` reports the original and current windows, the trigger point, and Smart Compact's actual automatic-compaction switch and minimum percentage.
 
 ## Automatic retry on upstream failures
 

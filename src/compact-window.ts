@@ -5,9 +5,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import type { QuotaConfig } from "./config.ts";
+import { formatTokens } from "./format.ts";
 import { SMART_COMPACT_MIN_CONTEXT_PERCENT } from "pi-smart-compact/extension-api";
 
 type Model = NonNullable<ExtensionContext["model"]>;
+
+/** 临时窗口对外可见的四种状态。 */
+type CompactWindowState = "off" | "paused" | "pending" | "active";
 
 /** 支持整数 tokens、k 和 m，例如 400k、0.4m。 */
 export function parseWindow(input: string): number | undefined {
@@ -34,6 +38,38 @@ export class CompactWindow {
     return SettingsManager.inMemory(this.pi.getSettings()).getCompactionSettings(model);
   }
 
+  /** Smart Compact 的全局设置。它自己的分支级开关不反映在这里。 */
+  private smartSettings(): { autoTrigger?: boolean; minContextPercent?: number } {
+    const effective = this.pi.getSettings() as {
+      smartCompact?: { autoTrigger?: boolean; minContextPercent?: number };
+    };
+    return effective.smartCompact ?? {};
+  }
+
+  private state(config: QuotaConfig): CompactWindowState {
+    if (!config.compactWindowEnabled) return "off";
+    if (this.paused) return "paused";
+    return this.replacement ? "active" : "pending";
+  }
+
+  /** 状态栏用的短标签，形如 `400K`。 */
+  label(config: QuotaConfig): string {
+    const state = this.state(config);
+    if (state === "active") return formatTokens(config.compactWindowTokens);
+    return { off: "关", paused: "暂停", pending: "待启用" }[state];
+  }
+
+  /** 详情面板用的一行说明。 */
+  detail(config: QuotaConfig): string {
+    const state = this.state(config);
+    if (state === "active") return `${config.compactWindowTokens.toLocaleString()} tokens`;
+    return {
+      off: "已关闭",
+      paused: "已暂停，/v2ex compact on 可重试",
+      pending: "待启用",
+    }[state];
+  }
+
   validate(model: Model, window: number): void {
     const original = model === this.replacement ? this.original! : model;
     const settings = this.settings(original);
@@ -44,8 +80,8 @@ export class CompactWindow {
     if (!this.pi.getCommands().some((command) => command.name === "smart-compact")) {
       throw new Error("请先安装并加载 pi-smart-compact，再设置临时窗口");
     }
-    const smart = (effective as { smartCompact?: { autoTrigger?: boolean; minContextPercent?: number } }).smartCompact;
-    if (smart?.autoTrigger === false) {
+    const smart = this.smartSettings();
+    if (smart.autoTrigger === false) {
       throw new Error("Smart Compact 的自动压缩已关闭，请在 /smart-compact settings 中开启后重试");
     }
     const minPercent = smart?.minContextPercent ?? SMART_COMPACT_MIN_CONTEXT_PERCENT;
@@ -113,12 +149,15 @@ export class CompactWindow {
     if (!model) return "请先选择 V2EX 模型，再查看临时窗口";
     const original = model === this.replacement ? this.original! : model;
     const settings = this.settings(model);
-    const state = !config.compactWindowEnabled ? "已关闭" : this.paused ? "暂未启用，/v2ex compact on 可重试" : this.replacement ? "已开启" : "已关闭";
-    return `V2EX 临时窗口：${state}\n` +
+    const smart = this.smartSettings();
+    const minPercent = smart.minContextPercent ?? SMART_COMPACT_MIN_CONTEXT_PERCENT;
+    return `V2EX 临时窗口：${this.detail(config)}\n` +
       `原始窗口 ${original.contextWindow.toLocaleString()}，当前窗口 ${model.contextWindow.toLocaleString()}，` +
       `目标窗口 ${config.compactWindowTokens.toLocaleString()} tokens\n` +
       `自动压缩触发点：超过 ${Math.max(0, model.contextWindow - settings.reserveTokens).toLocaleString()} tokens` +
       `（窗口的 ${((1 - settings.reserveTokens / model.contextWindow) * 100).toFixed(1)}%）\n` +
-      "Smart Compact 的自动开关和最低占比请在 /smart-compact settings 中查看";
+      (smart.autoTrigger === false
+        ? `Smart Compact 自动压缩：已关闭，低于最低占比 ${minPercent}% 也不会触发，请在 /smart-compact settings 中开启`
+        : `Smart Compact 自动压缩：已开启，最低占比 ${minPercent}%（可在 /smart-compact settings 中调整）`);
   }
 }

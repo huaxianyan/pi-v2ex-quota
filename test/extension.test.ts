@@ -107,6 +107,16 @@ async function startExtension(config: Record<string, unknown>): Promise<Harness>
     sendUserMessage(content: unknown) {
       sent.push(typeof content === "string" ? content : JSON.stringify(content));
     },
+    // 临时窗口通过 pi 的模型副本生效，测试台只记录这次替换。
+    getSettings: () => ({
+      compaction: { reserveTokens: 136_000, keepRecentTokens: 20_000 },
+      smartCompact: { autoTrigger: true },
+    }),
+    getCommands: () => [{ name: "smart-compact" }],
+    async setModel(model: unknown) {
+      harness.ctx.model = model as Harness["ctx"]["model"];
+      return true;
+    },
   };
 
   factory(pi as unknown as ExtensionAPI);
@@ -324,19 +334,45 @@ test("改开关后状态栏立刻反映，不等下一次轮询", async () => {
     await ext.emit("session_start", { type: "session_start", reason: "startup" });
     await sleep(80);
     // 测试台的轮询间隔是 3600 秒，所以这一行只可能由开关自己触发刷新。
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 关$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 关 · 窗口 关$/);
 
     await ext.run("v2ex", "wait on");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 关$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 关 · 窗口 关$/);
 
     await ext.run("v2ex", "retry on");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 开$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 开 · 重试 开 · 窗口 关$/);
 
     await ext.run("v2ex", "wait off");
-    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 开$/);
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /续跑 关 · 重试 开 · 窗口 关$/);
   } finally {
     restore();
   }
+});
+
+test("临时窗口的开关一改，状态栏那一段立刻跟着变", async () => {
+  const ext = await startExtension({ status: true, pollSeconds: 3600 });
+  await ext.emit("session_start", { type: "session_start", reason: "startup" });
+  assert.match(ext.statuses.get(STATUS_KEY) ?? "", /窗口 关$/);
+
+  await ext.run("v2ex", "compact on");
+  assert.equal(ext.ctx.model?.contextWindow, 400_000, "临时窗口没有生效");
+  assert.match(ext.statuses.get(STATUS_KEY) ?? "", /窗口 400K$/);
+
+  await ext.run("v2ex", "compact window 500k");
+  assert.equal(ext.ctx.model?.contextWindow, 500_000);
+  assert.match(ext.statuses.get(STATUS_KEY) ?? "", /窗口 500K$/);
+
+  await ext.run("v2ex", "compact off");
+  assert.equal(ext.ctx.model?.contextWindow, 1_000_000, "关闭后应恢复原始窗口");
+  assert.match(ext.statuses.get(STATUS_KEY) ?? "", /窗口 关$/);
+
+  // 详情面板也跟着说人话：「关」换成一整句。
+  await ext.emit("session_start", { type: "session_start", reason: "startup" });
+  await ext.run("v2ex", "compact status");
+  assert.ok(
+    ext.notifications.some((item) => item.message.includes("V2EX 临时窗口：已关闭")),
+    `面板没报出窗口状态：${JSON.stringify(ext.notifications)}`,
+  );
 });
 
 test("配额用尽时立刻中止本轮并提示", async () => {
