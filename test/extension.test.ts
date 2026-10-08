@@ -61,6 +61,7 @@ function makeCtx(cwd: string) {
       },
     },
     mode: "tui",
+    model: { provider: "v2ex", id: "test-model" },
     cwd,
     isIdle: () => true,
     signal: undefined as AbortSignal | undefined,
@@ -227,6 +228,72 @@ test("扩展注册命令并订阅配额相关事件", async () => {
     "agent_end",
   ]) {
     assert.ok(ext.events.has(event), `缺少事件订阅：${event}`);
+  }
+});
+
+test("选择其他模型时保持原有报错行为，切离 V2EX 后取消等待并隐藏配额", async () => {
+  let delayMs = 0;
+  const restore = stubQuota(
+    () => 0,
+    () => Date.now() - 60_000,
+    () => true,
+    () => delayMs,
+  );
+  const ext = await startExtension({ autoWait: true, retryOnError: true, resumeBufferSeconds: 0 });
+  const reportErrors = async () => {
+    await ext.emit("after_provider_response", exhaustedResponse(Date.now() - 60_000));
+    for (const errorMessage of ["quota exhausted", "Connection error."]) {
+      await ext.emit("message_end", {
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage },
+      });
+    }
+    await ext.emit("agent_settled", { type: "agent_settled" });
+  };
+  const select = async (provider: string) => {
+    ext.ctx.model = { provider, id: "test-model" };
+    await ext.emit("model_select", { type: "model_select", model: ext.ctx.model });
+  };
+  try {
+    ext.ctx.model.provider = "other";
+    await ext.emit("session_start", { type: "session_start", reason: "startup" });
+    await reportErrors();
+    assert.equal(ext.abortCount(), 0);
+    assert.equal(ext.notifications.length, 0);
+    assert.equal(ext.statuses.size, 0);
+    assert.equal(readPlan(ext.dir), undefined);
+
+    await select("v2ex");
+    await ext.run("v2ex", "");
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX /);
+    assert.ok(ext.widgets.has("v2ex-quota-details"));
+    await reportErrors();
+    assert.ok(readPlan(ext.dir));
+
+    // 模拟切换时尚未返回的查询，确保旧响应也不会重新显示配额。
+    delayMs = 50;
+    const refreshing = ext.run("v2ex", "");
+    await select("other");
+    const notifications = ext.notifications.length;
+    const aborts = ext.abortCount();
+    await refreshing;
+    await reportErrors();
+    await sleep(1_100);
+    assert.equal(ext.statuses.size, 0);
+    assert.equal(ext.widgets.size, 0);
+    assert.equal(readPlan(ext.dir), undefined);
+    assert.equal(ext.notifications.length, notifications);
+    assert.equal(ext.abortCount(), aborts);
+    assert.deepEqual(ext.sent, []);
+
+    delayMs = 0;
+    await select("v2ex");
+    await ext.run("v2ex", "");
+    assert.match(ext.statuses.get(STATUS_KEY) ?? "", /^V2EX /);
+    assert.equal(readPlan(ext.dir), undefined);
+  } finally {
+    await ext.emit("session_shutdown", { type: "session_shutdown" });
+    restore();
   }
 });
 

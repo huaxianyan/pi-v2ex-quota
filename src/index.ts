@@ -129,6 +129,8 @@ export default function (pi: ExtensionAPI) {
   let countdownTickTimer: ReturnType<typeof setInterval> | undefined;
   let lastCtx: ExtensionContext | undefined;
   let uiDisabled = false;
+  let active = false;
+  let modelGeneration = 0;
 
   function log(message: string): void {
     if (!config.debug) return;
@@ -186,7 +188,7 @@ export default function (pi: ExtensionAPI) {
   function refreshStatus(ctx: ExtensionContext): void {
     if (!canUseUi(ctx)) return;
     applyUi("setStatus", () => {
-      if (!config.status || !endpoint) {
+      if (!active || !config.status || !endpoint) {
         ctx.ui.setStatus(STATUS_KEY, undefined);
         return;
       }
@@ -238,14 +240,14 @@ export default function (pi: ExtensionAPI) {
   }
 
   function renderDetails(ctx: ExtensionContext): void {
-    if (!detailsVisible || !canUseUi(ctx)) return;
+    if (!active || !detailsVisible || !canUseUi(ctx)) return;
     applyUi("setWidget", () =>
       ctx.ui.setWidget(DETAILS_KEY, detailLines(), { placement: "belowEditor" }),
     );
   }
 
   function toggleDetails(ctx: ExtensionContext): void {
-    if (!canUseUi(ctx)) return;
+    if (!active || !canUseUi(ctx)) return;
     detailsVisible = !detailsVisible;
     if (detailsVisible) {
       renderDetails(ctx);
@@ -261,10 +263,13 @@ export default function (pi: ExtensionAPI) {
 
   /** 取一次配额快照。返回本次查询是否成功，供「以查询结果为准」的调用方判断。 */
   async function pollQuota(ctx: ExtensionContext): Promise<boolean> {
-    if (!endpoint) return false;
+    if (!active || !endpoint) return false;
+    const generation = modelGeneration;
     let ok = true;
     try {
-      latest = await fetchQuota(endpoint);
+      const snapshot = await fetchQuota(endpoint);
+      if (!active || generation !== modelGeneration) return false;
+      latest = snapshot;
       log(
         `quota: active=${latest.active} remaining=${latest.remainingTokens}` +
           ` extra=${latest.extraRemainingTokens} reset=${latest.periodEnd}`,
@@ -273,6 +278,7 @@ export default function (pi: ExtensionAPI) {
       ok = false;
       log(`quota fetch failed: ${errorText(error)}`);
     }
+    if (!active || generation !== modelGeneration) return false;
     refreshStatus(ctx);
     renderDetails(ctx);
     return ok;
@@ -286,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 
   function startPolling(ctx: ExtensionContext): void {
     stopPolling();
-    if (!config.status || !endpoint || !canUseUi(ctx)) {
+    if (!active || !config.status || !endpoint || !canUseUi(ctx)) {
       refreshStatus(ctx);
       return;
     }
@@ -432,7 +438,8 @@ export default function (pi: ExtensionAPI) {
   async function resumeNow(ctx: ExtensionContext): Promise<void> {
     resumeTimer = undefined;
     const current = pending;
-    if (!current) return;
+    if (!active || !current) return;
+    const generation = modelGeneration;
     if (Date.now() < current.resumeAt) {
       armWait(ctx, current.resumeAt, current.prompt, current.reason);
       return;
@@ -451,12 +458,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      latest = await fetchQuota(endpoint);
+      const snapshot = await fetchQuota(endpoint);
+      if (!active || generation !== modelGeneration || pending !== current) return;
+      latest = snapshot;
       log(`resume precheck: remaining=${latest.remainingTokens} reset=${latest.periodEnd}`);
     } catch (error) {
       log(`resume precheck failed: ${errorText(error)}`);
     }
 
+    if (!active || generation !== modelGeneration || pending !== current) return;
     const deadline = resetDeadlineMs(latest);
     const bufferedDeadline =
       deadline === undefined ? undefined : deadline + config.resumeBufferSeconds * 1000;
@@ -553,6 +563,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const fetched = await pollQuota(ctx);
+    if (!active) return;
     if (!fetched || !latest) {
       notify(ctx, "配额查询失败，无法确认当前额度，未排入等待", "warning");
       return;
@@ -620,6 +631,38 @@ export default function (pi: ExtensionAPI) {
     notify(ctx, `V2EX ${what}已恢复，${formatDuration(pending.resumeAt - Date.now())} 后自动继续`, "info");
   }
 
+  function selectProvider(provider: string | undefined, ctx: ExtensionContext): void {
+    lastCtx = ctx;
+    const nextActive = provider === "v2ex";
+    if (active === nextActive) return;
+    active = nextActive;
+    modelGeneration += 1;
+    if (active) {
+      endpoint = resolveEndpoint();
+      restorePending(ctx);
+      startPolling(ctx);
+      return;
+    }
+    stopPolling();
+    clearWait("已切换到其他 provider", ctx);
+    stopCountdown();
+    latest = undefined;
+    quotaHit = false;
+    transientHit = false;
+    transientError = undefined;
+    transientAttempts = 0;
+    transientAdvised = false;
+    selfResume = false;
+    detailsVisible = false;
+    if (canUseUi(ctx)) {
+      applyUi("setWidget", () => ctx.ui.setWidget(DETAILS_KEY, undefined));
+    }
+  }
+
+  pi.on("model_select", async (event, ctx) => {
+    selectProvider(event.model.provider, ctx);
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     lastCtx = ctx;
     projectCwd = ctx.cwd;
@@ -630,13 +673,10 @@ export default function (pi: ExtensionAPI) {
         ` retryOnError=${config.retryOnError}` +
         ` endpoint=${endpoint ? quotaUrl(endpoint.baseUrl) : "missing"}`,
     );
-    if (!endpoint) {
-      refreshStatus(ctx);
+    selectProvider(ctx.model?.provider, ctx);
+    if (active && !endpoint) {
       notify(ctx, "未在 models.json 找到 v2ex provider，配额状态不可用", "warning");
-      return;
     }
-    restorePending(ctx);
-    startPolling(ctx);
   });
 
   pi.on("session_shutdown", async () => {
@@ -650,6 +690,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
+    if (!active) return;
     lastCtx = ctx;
     log(
       `provider response: status=${event.status}` +
@@ -672,6 +713,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event, ctx) => {
+    if (!active) return;
     lastCtx = ctx;
     const message = event.message as {
       role?: string;
@@ -689,6 +731,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    if (!active) return;
     lastCtx = ctx;
 
     if (quotaHit) {
@@ -741,6 +784,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
+    if (!active) return;
     lastCtx = ctx;
     if (selfResume) {
       selfResume = false;
@@ -814,6 +858,10 @@ export default function (pi: ExtensionAPI) {
       return items.length > 0 ? [...items] : null;
     },
     handler: async (args, ctx) => {
+      if (!active) {
+        notify(ctx, "请先切换到 V2EX 模型，再使用 /v2ex", "info");
+        return;
+      }
       lastCtx = ctx;
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       const action = tokens[0] ?? "";
@@ -826,6 +874,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (action === "refresh") {
         const fetched = await pollQuota(ctx);
+        if (!active) return;
         if (!fetched) {
           notify(ctx, "配额查询失败，开启 /v2ex debug on 可看日志", "warning");
           return;
