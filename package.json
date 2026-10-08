@@ -28,7 +28,12 @@
     "verify:start": "node tools/verify-resume.mjs --case start",
     "verify:start-live": "node tools/verify-resume.mjs --case start-live",
     "verify:retry": "node tools/verify-resume.mjs --case retry",
+    "verify:compact-window": "node tools/verify-compact-window.mjs",
+    "verify:compact-recovery": "node tools/verify-compact-window.mjs --recovery",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pi-smart-compact": "git+https://github.com/huaxianyan/pi-smart-compact.git#v2ex-recovery"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

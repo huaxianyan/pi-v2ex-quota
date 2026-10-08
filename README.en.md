@@ -10,6 +10,7 @@ Surfaces your V2EX AI Chat quota in pi's status line, automatically continues th
 2. **Immediate takeover**: when the quota is exhausted (HTTP 429 with a zero token balance) it aborts the current turn at once, instead of sitting through pi's three backoff retries.
 3. **Auto-resume** (optional toggle): waits until the window resets, re-checks the quota, then injects a message so the agent picks up the unfinished work.
 4. **Upstream retry** (optional toggle, off by default): when a 5xx, timeout or dropped connection kills the turn, waits out a backoff and picks the work up again.
+5. **Temporary context window** (off by default): reduces the current V2EX session's advertised window to trigger Pi's automatic compaction earlier, with the loaded Smart Compact extension handling summaries.
 
 ## Installation
 
@@ -33,7 +34,7 @@ pi -e /path/to/pi-v2ex-quota/src/index.ts
 
 To remove: `pi remove git:github.com/huaxianyan/pi-v2ex-quota` (for a local mount, swap in that path).
 
-There is exactly one prerequisite: `providers.v2ex` configured in `~/.pi/agent/models.json` — both the quota endpoint and the key are read from there.
+Configure `providers.v2ex` in `~/.pi/agent/models.json`; the quota endpoint and key are read from there. The extension is active only while a V2EX model is selected. Switching to another provider stops polling and waiting, and hides the quota UI.
 
 Run `/v2ex` after installing and the quota shows up.
 
@@ -49,6 +50,10 @@ Run `/v2ex` after installing and the quota shows up.
 | `/v2ex start [prompt]` | Quota is known to be exhausted — queue a wait and auto-resume right away (no need to burn a message against the wall first) |
 | `/v2ex cancel` | Cancel a pending auto-resume or upstream retry |
 | `/v2ex debug on\|off` | Write a debug log to `v2ex-quota.log` in the agent directory |
+| `/v2ex compact window 400k` | Set and enable the temporary window; accepts integers, `k`, and `m` |
+| `/v2ex compact on` | Enable the saved target window |
+| `/v2ex compact off` | Disable the override and restore the original model window |
+| `/v2ex compact status` | Show the original/current window and automatic compaction threshold |
 
 ## Configuration
 
@@ -59,6 +64,8 @@ A single global file, `~/.pi/agent/v2ex-quota.json`. There is no per-project ove
 | `status` | `true` | Show the quota in the status line |
 | `autoWait` | `false` | Wait for the reset and auto-resume when the quota is exhausted |
 | `retryOnError` | `false` | Retry with backoff on upstream 5xx / timeout / connection loss |
+| `compactWindowEnabled` | `false` | Enable the current session's temporary window |
+| `compactWindowTokens` | `400000` | Target window in tokens |
 | `errorRetrySeconds` | `60` | First retry delay in seconds; doubles afterwards; range 5–3600 |
 | `maxErrorRetries` | `3` | Consecutive retry cap; a successful response or you taking over the turn resets it; range 1–10 |
 | `pollSeconds` | `60` | Poll interval, also the status line refresh interval; range 15–3600 |
@@ -116,6 +123,39 @@ A few boundaries:
 - **The wait plan is persisted too.** Restarting pi resumes it; but if you turned `/v2ex retry off`, restoring the plan at startup is skipped as well.
 
 The status line switches from the quota segment to `V2EX 重试 45s`, and the notification names the failure class (`HTTP 522` / request timeout / connection loss) and which attempt this is. The last minute ticks per second here too, and at zero it becomes `V2EX 即将重试`.
+
+## Temporary window and automatic compaction
+
+Automatic recovery requires the Smart Compact fork with the extension API, based on 9.7.1:
+
+```bash
+pi install git:github.com/huaxianyan/pi-smart-compact@v2ex-recovery
+```
+
+After installation, use `pi list` to locate the old Smart Compact source and `pi remove <old-source>` to remove it. Keep one loaded Smart Compact installation and restart or `/reload`. Existing Smart Compact settings remain in use.
+
+Then run:
+
+```text
+/v2ex compact window 400k
+/v2ex compact status
+```
+
+Only a copy of the current session's V2EX model is replaced. `models.json` and Pi's compaction settings retain their original values. The switch and target are saved in `v2ex-quota.json` and reapplied on startup and `/reload`. Selecting another V2EX model validates and applies the target against that model. `compact off` restores the original window and saves the disabled state; Pi's ordinary automatic compaction remains enabled according to its own settings. Commands that change the window require an idle session.
+
+Pi triggers above `contextWindow - reserveTokens`. A 400,000-token window with 136,000 reserved tokens triggers above 264,000 tokens (66%), satisfying Smart Compact's default 60% gate. The extension uses Pi's per-model reserve settings and checks the configured Smart Compact percentage gate.
+
+Successful automatic compaction applies the Smart Compact summary and continues without manual Apply. Manual `/smart-compact` approval remains unchanged. Summary routing follows Smart Compact's own settings, using the current model by default. Enable its automatic path in `/smart-compact settings`. The extension checks global settings; Smart Compact owns its branch-specific switches.
+
+### Unattended recovery
+
+After an automatic compaction fails, the current run ends while the context and temporary window are retained. Once idle, the extension requests Smart Compact's existing `fast` pipeline with a 300-second deadline (a lower global Smart Compact time budget still applies). Only the verified summary from that request may be applied. Success automatically resumes the original task without Apply confirmation.
+
+Quota exhaustion waits for a reset; timeout and connection failures use `errorRetrySeconds` backoff. The persisted plan is scoped to the original session, model, and task branch. Reopen the same session after restarting to continue; a new session is a different task and drops the old plan. Each plan permits `1 + maxErrorRetries` recovery checks, including quota prechecks (4 by default). Recovery is controlled by the temporary-window switch, independently of ordinary auto-resume and upstream-retry switches.
+
+`/v2ex cancel`, `compact off`, a model/branch switch, or a new user task cancels the old plan and any active recovery. Exhausted budgets and permanent failures pause the temporary window and restore the original one. Session history remains available; manually compact and use `compact on` after fixing the cause.
+
+The initial native automatic attempt may still fail before recovery begins. Recovery reuses Smart Compact extraction, summarization, and verification; it does not forcibly discard unsummarized history. Authentication and unavailable-model problems still require human intervention.
 
 ## Outbound proxy (following pi; the extension manages none of its own)
 
@@ -306,7 +346,16 @@ npm run verify:start-live      # after /v2ex start schedules, do the countdown a
 npm run verify:retry           # does it retry with backoff after an upstream 522
 ```
 
-All five cases:
+Temporary-window verification:
+
+```bash
+npm run verify:compact-window
+npm run verify:compact-recovery
+```
+
+This uses real Pi and the installed Smart Compact extension to verify commands, restoration, model switches, reload, and automatic summary application. The recovery case also exercises failed automatic compaction, quota waiting, reload restoration, and task resumption. Model responses are fixed fixtures; all state is temporary and no upstream quota is used. Set `SMART_COMPACT_EXTENSION` to an alternative Smart Compact `dist/index.js` path. This verifies extension integration, not live V2EX summarization quality or availability.
+
+All five resume cases:
 
 1. Move the whole agent directory to a temp dir via `PI_CODING_AGENT_DIR`, so **your real config and wait plan are never touched**;
 2. Start a real pi with `--mode rpc` and watch the event stream / debug log;

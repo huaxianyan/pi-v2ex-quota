@@ -136,6 +136,9 @@ function buildQuotaSegment(input: StatusInput): StatusView {
   const due = left !== undefined && left < COUNTDOWN_DUE_MS;
 
   if (waiting) {
+    if (waitReason === "compact") {
+      return plainView(due ? `${LABEL} 整理上下文` : `${LABEL} 整理前等待 ${countdown || "中"}`, "waiting");
+    }
     // 上游故障与额度无关，窗口里还有量也照样在等重试。
     if (waitReason === "error") {
       // 倒计时归零后改说「即将」：到点与真正续跑之间还隔着一次复核与消息注入，
@@ -215,6 +218,10 @@ export function buildDetails(input: DetailsInput): string[] {
   const { window, now, waiting, waitReason, autoWaitLabel, retryOnErrorLabel } = input;
   const toggles = [`自动续跑：${autoWaitLabel}`, `上游重试：${retryOnErrorLabel}`];
   const lines = [`${LABEL} AI Chat 配额`];
+  if (waiting && waitReason === "compact") {
+    const left = input.resumeAt === undefined ? 0 : input.resumeAt - now;
+    lines.push(left < COUNTDOWN_DUE_MS ? "正在整理上下文，完成后继续任务" : `${formatDuration(left)} 后先整理上下文，再继续任务`);
+  }
   if (!window) {
     lines.push("尚未取到配额数据，/v2ex refresh 重试", ...toggles);
     return lines;

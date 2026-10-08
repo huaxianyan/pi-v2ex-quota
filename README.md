@@ -10,6 +10,7 @@
 2. **立刻接手**：配额用尽时（HTTP 429 + token 余额归零）马上中止本轮，不再陪 pi 把三次退避重试跑完。
 3. **自动续跑**（可选开关）：等到窗口刷新，先复核配额，再注入一条消息让 agent 接着做没做完的事。
 4. **上游故障重试**（可选开关，默认关闭）：5xx / 超时 / 连接中断把本轮打断时，等一段退避时间后自动接着做。
+5. **临时上下文窗口**（默认关闭）：在当前会话中缩小 V2EX 的窗口声明，提前触发 pi 自动压缩，摘要由已加载的 Smart Compact 处理。
 
 ## 安装
 
@@ -33,7 +34,7 @@ pi -e /path/to/pi-v2ex-quota/src/index.ts
 
 移除：`pi remove git:github.com/huaxianyan/pi-v2ex-quota`（本地挂载则把源换成对应路径）。
 
-扩展的运行前提只有一个：`~/.pi/agent/models.json` 里配好了 `providers.v2ex` —— 配额接口与密钥都从那里读。
+配额接口与密钥从 `~/.pi/agent/models.json` 的 `providers.v2ex` 读取。扩展只在当前选择 V2EX 模型时生效。切换到其他 provider 后，配额显示、轮询和等待结束。
 
 装完执行 `/v2ex` 就能看到配额。
 
@@ -49,6 +50,10 @@ pi -e /path/to/pi-v2ex-quota/src/index.ts
 | `/v2ex start [提示词]` | 已知配额用尽，立即排入等待并自动续跑（不必先发一条消息去撞墙） |
 | `/v2ex cancel` | 取消等待中的自动续跑或上游故障重试 |
 | `/v2ex debug on\|off` | 写调试日志到 agent 目录下的 `v2ex-quota.log` |
+| `/v2ex compact window 400k` | 设置并启用临时上下文窗口，支持整数、`k` 和 `m` |
+| `/v2ex compact on` | 启用已保存的目标窗口 |
+| `/v2ex compact off` | 关闭临时窗口，恢复模型原始窗口 |
+| `/v2ex compact status` | 查看原始窗口、当前窗口和自动压缩触发点 |
 
 ## 配置
 
@@ -59,6 +64,8 @@ pi -e /path/to/pi-v2ex-quota/src/index.ts
 | `status` | `true` | 在状态栏显示配额 |
 | `autoWait` | `false` | 配额用尽时等待刷新并自动续跑 |
 | `retryOnError` | `false` | 上游 5xx / 超时 / 连接中断时退避重试 |
+| `compactWindowEnabled` | `false` | 启用当前会话的临时窗口 |
+| `compactWindowTokens` | `400000` | 目标窗口大小，单位 tokens |
 | `errorRetrySeconds` | `60` | 上游故障后的首次重试等待秒数，之后翻倍，范围 5–3600 |
 | `maxErrorRetries` | `3` | 连续重试次数上限，一次成功响应或你自己接管本轮都会清零，范围 1–10 |
 | `pollSeconds` | `60` | 轮询间隔，同时也是状态栏刷新间隔，范围 15–3600 |
@@ -153,6 +160,65 @@ V2EX -- | 续跑 关 · 重试 关                       还没取到数据
 - **等待计划同样落盘**。重启 pi 能接着等；但如果 `retry off` 关掉了，「启动时恢复计划」也会一并跳过。
 
 状态栏的配额段会切成 `V2EX 重试 45s`（开关段照旧），进入最后一分钟同样逐秒走，归零后是 `V2EX 即将重试`。通知里写清是哪一类故障（`HTTP 522` / 请求超时 / 连接中断）与第几次重试。
+
+## 临时窗口与自动压缩
+
+自动补救需要带调用接口的 Smart Compact fork（基于 9.7.1）：
+
+```bash
+pi install git:github.com/huaxianyan/pi-smart-compact@v2ex-recovery
+```
+
+安装成功后，用 `pi list` 找到旧的 Smart Compact 来源并执行 `pi remove <旧来源>`。
+保留一个 Smart Compact 安装来源，再重启或 `/reload`。原有 Smart Compact 设置继续使用。
+
+然后执行：
+
+```text
+/v2ex compact window 400k
+/v2ex compact status
+```
+
+功能只替换当前会话使用的 V2EX 模型副本。`models.json` 和 pi 的压缩设置保留原值。
+开关与目标窗口保存在 `v2ex-quota.json`，启动和 `/reload` 后重新应用。
+切换 V2EX 模型时，按新模型的原始窗口检查并应用。
+`/v2ex compact off` 恢复当前模型的原始窗口，并保存关闭状态。
+关闭临时窗口后，pi 原有的自动压缩设置继续生效。
+
+实际触发点由 pi 计算：`contextWindow - reserveTokens`。
+例如窗口为 400,000 tokens、预留量为 136,000 tokens 时，超过 264,000 tokens 就触发。
+此时占临时窗口的 66%，高于 Smart Compact 默认的 60% 门槛。
+扩展读取 pi 的逐模型预留量，并检查目标窗口与 Smart Compact 最低占比是否匹配。
+当前任务结束后才能用命令调整窗口。
+
+pi 自动压缩会调用 Smart Compact 的自动摘要路径，成功后自动应用并继续任务。
+手动 `/smart-compact` 的 Apply 确认保持原有设置。
+摘要默认使用当前模型，显式设置过摘要模型时遵循 Smart Compact 的设置。
+在 `/smart-compact settings` 中确认自动压缩已开启。
+Smart Compact 的分支级开关由它自己管理，扩展只检查全局设置。
+
+### 无人值守补救
+
+第一次自动压缩失败时，本轮先结束，原上下文和临时窗口保留。
+会话空闲后，扩展请求 Smart Compact 用 `fast` 模式补救，处理时限为 300 秒。
+更低的 Smart Compact 全局时间预算仍然生效。
+补救成功后自动应用摘要，再继续原任务，全程免 Apply 确认。
+补救应用只接受本次已验证的摘要，失败时停留在原会话。
+
+补救前会查询配额。配额用尽就等刷新，超时和连接故障按 `errorRetrySeconds` 退避。
+恢复计划保存原会话、模型和任务分支，重启后恢复同一个会话即可接着处理。
+关闭 pi 再新建会话，属于另一个任务，旧计划结束。
+每次计划最多检查 `1 + maxErrorRetries` 次，包括配额复核，默认 4 次。
+补救由临时窗口开关控制，独立于普通续跑和上游重试开关。
+
+`/v2ex cancel` 或 `/v2ex compact off` 可以取消等待及正在进行的补救。
+切换模型、切到其他任务分支或自己发起新任务，也会取消原计划。
+达到预算或遇到无法自动解决的错误，才暂停临时窗口并恢复原始窗口。
+原会话记录保留，可手动压缩后执行 `/v2ex compact on` 恢复。
+
+边界：第一次原生自动压缩仍可能走到原生摘要并失败，随后才进入补救。
+补救由 Smart Compact 现有的提取、摘要和验证流程处理，扩展不强制裁剪未摘要历史。
+永久认证错误、模型不可用等问题仍需要人工修复。
 
 ## 出网代理（跟随 pi，扩展不自己管）
 
@@ -306,7 +372,20 @@ npm run verify:start-live      # /v2ex start 排上后，倒计时与到点续�
 npm run verify:retry           # 上游 522 之后能不能按退避自动重试
 ```
 
-五条 case 都：
+临时窗口的独立验收：
+
+```bash
+npm run verify:compact-window
+npm run verify:compact-recovery
+```
+
+它使用真实 pi 和已安装的 Smart Compact，验证命令、恢复、模型切换、重载及摘要自动应用。
+`verify:compact-recovery` 额外演出自动压缩失败、配额等待、重载恢复和任务续跑。
+模型响应使用固定 fixture，全程使用临时 agent 目录，不消耗上游配额。
+可用 `SMART_COMPACT_EXTENSION` 指定 Smart Compact 的 `dist/index.js` 路径。
+这项验收证明扩展间的配合，V2EX 上游的摘要质量与可用性需在实际使用中观察。
+
+五条续跑 case 都：
 
 1. 用 `PI_CODING_AGENT_DIR` 把 agent 目录整个挪到临时目录，**不碰你真实的配置与等待计划**；
 2. 以 `--mode rpc` 起真 pi 并盯事件流／调试日志；

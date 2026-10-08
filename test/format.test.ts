@@ -21,6 +21,13 @@ function windowOf(overrides: Partial<QuotaWindow> = {}): QuotaWindow {
   };
 }
 
+test("压缩补救等待时显示整理计划，到点后显示整理上下文", () => {
+  assert.equal(buildStatus({ window: undefined, now: 1_000, waiting: true, waitReason: "compact", resumeAt: 6_000 }).text,
+    "V2EX 整理前等待 5s");
+  assert.equal(buildStatus({ window: undefined, now: 6_000, waiting: true, waitReason: "compact", resumeAt: 6_000 }).text,
+    "V2EX 整理上下文");
+});
+
 test("formatDuration 覆盖秒、分、时、天", () => {
   assert.equal(formatDuration(0), "0s");
   assert.equal(formatDuration(30_000), "30s");

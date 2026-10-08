@@ -61,7 +61,7 @@ function makeCtx(cwd: string) {
       },
     },
     mode: "tui",
-    model: { provider: "v2ex", id: "test-model" },
+    model: { provider: "v2ex", id: "test-model", contextWindow: 1_000_000 },
     cwd,
     isIdle: () => true,
     signal: undefined as AbortSignal | undefined,
@@ -251,7 +251,7 @@ test("选择其他模型时保持原有报错行为，切离 V2EX 后取消等�
     await ext.emit("agent_settled", { type: "agent_settled" });
   };
   const select = async (provider: string) => {
-    ext.ctx.model = { provider, id: "test-model" };
+    ext.ctx.model = { provider, id: "test-model", contextWindow: 1_000_000 };
     await ext.emit("model_select", { type: "model_select", model: ext.ctx.model });
   };
   try {

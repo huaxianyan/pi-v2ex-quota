@@ -160,6 +160,18 @@ test("等待原因会落盘，缺省或非法值退回「等配额刷新」", ()
   assert.equal(readPending(dir)?.reason, undefined);
 });
 
+test("压缩恢复计划保留原会话、模型和任务分支", () => {
+  const dir = tempDir();
+  writePending(dir, {
+    resumeAt: 1_790_075_684_000, attempts: 1, cwd: "E:/dev/pi", reason: "compact",
+    compact: { sessionId: "original-session", modelId: "coder", branchHeadId: "original-task" },
+  });
+  assert.deepEqual(readPending(dir)?.compact, {
+    sessionId: "original-session", modelId: "coder", branchHeadId: "original-task",
+  });
+  assert.equal(readPending(dir)?.reason, "compact");
+});
+
 test("损坏的等待计划当作不存在", () => {
   const dir = tempDir();
   writeFileSync(pendingPath(dir), JSON.stringify({ resumeAt: "later" }));

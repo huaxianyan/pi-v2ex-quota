@@ -29,6 +29,10 @@ export interface QuotaConfig {
    * 对多数人来说是意外行为，得显式开启。
    */
   retryOnError: boolean;
+  /** 用会话内的临时窗口提前触发 pi 自动压缩。 */
+  compactWindowEnabled: boolean;
+  /** 临时窗口大小，单位 tokens。 */
+  compactWindowTokens: number;
   /** 上游故障后的首次重试等待秒数，之后按次数指数退避。 */
   errorRetrySeconds: number;
   /** 连续重试次数上限；一次成功响应或用户接管本轮都会清零。 */
@@ -53,6 +57,8 @@ export const DEFAULT_CONFIG: QuotaConfig = {
   status: true,
   autoWait: false,
   retryOnError: false,
+  compactWindowEnabled: false,
+  compactWindowTokens: 400_000,
   errorRetrySeconds: 60,
   maxErrorRetries: 3,
   pollSeconds: 60,
@@ -64,11 +70,15 @@ export const DEFAULT_CONFIG: QuotaConfig = {
   debug: false,
 };
 
-/**
- * 这次等待在等什么：配额窗口刷新（quota），还是上游故障后的重试（error）。
- * 两者的到点行为不同 —— 前者要先复核额度，后者直接续跑。
- */
-export type WaitReason = "quota" | "error";
+/** 等待原因同时用于展示和落盘。compact 到点后先修复压缩，再继续任务。 */
+export type WaitReason = "quota" | "error" | "compact";
+
+export interface CompactRecovery {
+  sessionId: string;
+  modelId: string;
+  /** 原任务必须仍在当前分支的祖先中。 */
+  branchHeadId: string;
+}
 
 export interface PendingResume {
   /** 计划续跑的时刻（毫秒时间戳）。 */
@@ -81,6 +91,7 @@ export interface PendingResume {
   prompt?: string;
   /** 等待原因。缺省视为等配额刷新，兼容更早版本留下的计划文件。 */
   reason?: WaitReason;
+  compact?: CompactRecovery;
 }
 
 export function configPath(agentDir: string): string {
@@ -104,7 +115,7 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function optionalWaitReason(value: unknown): WaitReason | undefined {
-  return value === "quota" || value === "error" ? value : undefined;
+  return value === "quota" || value === "error" || value === "compact" ? value : undefined;
 }
 
 /** 把任意来源的对象收敛成合法配置，越界的值就地夹紧而不是报错。 */
@@ -115,6 +126,8 @@ export function normalizeConfig(raw: unknown): QuotaConfig {
     status: source["status"] === undefined ? DEFAULT_CONFIG.status : source["status"] === true,
     autoWait: source["autoWait"] === undefined ? DEFAULT_CONFIG.autoWait : source["autoWait"] === true,
     retryOnError: source["retryOnError"] === true,
+    compactWindowEnabled: source["compactWindowEnabled"] === true,
+    compactWindowTokens: clampInt(source["compactWindowTokens"], 1, Number.MAX_SAFE_INTEGER, DEFAULT_CONFIG.compactWindowTokens),
     errorRetrySeconds: clampInt(
       source["errorRetrySeconds"],
       5,
@@ -180,12 +193,22 @@ export function readPending(agentDir: string): PendingResume | undefined {
   const source = raw as Record<string, unknown>;
   const resumeAt = source["resumeAt"];
   if (typeof resumeAt !== "number" || !Number.isFinite(resumeAt)) return undefined;
+  const reason = optionalWaitReason(source["reason"]);
+  const rawCompact = source["compact"] as Partial<CompactRecovery> | null | undefined;
+  const compact = rawCompact &&
+    typeof rawCompact.sessionId === "string" && rawCompact.sessionId.length > 0 &&
+    typeof rawCompact.modelId === "string" && rawCompact.modelId.length > 0 &&
+    typeof rawCompact.branchHeadId === "string" && rawCompact.branchHeadId.length > 0
+    ? { sessionId: rawCompact.sessionId, modelId: rawCompact.modelId, branchHeadId: rawCompact.branchHeadId }
+    : undefined;
+  if (reason === "compact" && !compact) return undefined;
   return {
     resumeAt,
-    attempts: clampInt(source["attempts"], 0, 10, 0),
+    attempts: clampInt(source["attempts"], 0, 11, 0),
     cwd: typeof source["cwd"] === "string" ? source["cwd"] : "",
     prompt: optionalString(source["prompt"]),
-    reason: optionalWaitReason(source["reason"]),
+    reason,
+    ...(compact ? { compact } : {}),
   };
 }
 
